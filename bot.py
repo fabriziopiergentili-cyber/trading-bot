@@ -32,10 +32,10 @@ def log(msg):
         pass
 
 # ─── BYBIT: FIRMA ─────────────────────────────────────────────────────────────
-def get_headers(params=""):
+def get_headers(payload=""):
     ts = str(int(time.time() * 1000))
     recv_window = "5000"
-    sign_str = ts + BYBIT_API_KEY + recv_window + params
+    sign_str = ts + BYBIT_API_KEY + recv_window + payload
     signature = hmac.new(
         BYBIT_API_SECRET.encode("utf-8"),
         sign_str.encode("utf-8"),
@@ -52,34 +52,49 @@ def get_headers(params=""):
 # ─── BYBIT: DATI MERCATO ──────────────────────────────────────────────────────
 def get_market_data():
     try:
-        r = requests.get(
-            f"{BASE_URL}/v5/market/kline",
-            params={"category": "spot", "symbol": SYMBOL, "interval": "60", "limit": 50},
-            timeout=10
-        )
-        data = r.json()
+        url = f"{BASE_URL}/v5/market/kline"
+        params = {
+            "category": "spot",
+            "symbol": SYMBOL,
+            "interval": "60",
+            "limit": "50"
+        }
+        r = requests.get(url, params=params, timeout=15)
+        raw = r.text
+        data = json.loads(raw)
+
+        if data.get("retCode") != 0:
+            log(f"[ERRORE] Bybit API: {data.get('retMsg')}")
+            return {}
+
         candles = data["result"]["list"]
+        if not candles:
+            log("[ERRORE] Nessuna candela ricevuta")
+            return {}
+
         closes  = [float(c[4]) for c in candles]
         volumes = [float(c[5]) for c in candles]
 
+        # RSI
         gains  = [max(closes[i] - closes[i-1], 0) for i in range(1, len(closes))]
         losses = [max(closes[i-1] - closes[i], 0) for i in range(1, len(closes))]
         avg_g  = sum(gains[-14:]) / 14
         avg_l  = sum(losses[-14:]) / 14
-        rsi    = 100 - (100 / (1 + avg_g / avg_l)) if avg_l != 0 else 50
+        rsi    = round(100 - (100 / (1 + avg_g / avg_l)), 2) if avg_l != 0 else 50
 
+        # MACD
         ema12 = sum(closes[-12:]) / 12
         ema26 = sum(closes[-26:]) / 26
-        macd  = ema12 - ema26
+        macd  = round(ema12 - ema26, 2)
 
         current   = closes[-1]
-        change24h = ((current - closes[0]) / closes[0]) * 100
+        change24h = round(((current - closes[0]) / closes[0]) * 100, 2)
 
         return {
             "price":     round(current, 2),
-            "change24h": round(change24h, 2),
-            "rsi":       round(rsi, 2),
-            "macd":      round(macd, 2),
+            "change24h": change24h,
+            "rsi":       rsi,
+            "macd":      macd,
             "volume":    round(sum(volumes[-5:]) / 5, 2),
             "high":      round(max(closes[-24:]), 2),
             "low":       round(min(closes[-24:]), 2),
@@ -91,15 +106,18 @@ def get_market_data():
 # ─── BYBIT: BILANCIO ─────────────────────────────────────────────────────────
 def get_balance():
     try:
-        params = "accountType=UNIFIED"
-        headers = get_headers(params)
+        query = "accountType=UNIFIED"
+        headers = get_headers(query)
         r = requests.get(
             f"{BASE_URL}/v5/account/wallet-balance",
             params={"accountType": "UNIFIED"},
             headers=headers,
-            timeout=10
+            timeout=15
         )
-        data = r.json()
+        data = json.loads(r.text)
+        if data.get("retCode") != 0:
+            log(f"[ERRORE] Bilancio API: {data.get('retMsg')}")
+            return 0.0
         coins = data["result"]["list"][0]["coin"]
         usdt = next((c for c in coins if c["coin"] == "USDT"), None)
         return float(usdt["availableToWithdraw"]) if usdt else 0.0
@@ -112,7 +130,7 @@ def place_order(side, price, balance):
     try:
         qty = round((balance * RISK_PCT) / price, 6)
         if qty <= 0:
-            log("⚠️ Quantità ordine troppo bassa")
+            log("Quantita ordine troppo bassa")
             return False
 
         body = {
@@ -123,20 +141,20 @@ def place_order(side, price, balance):
             "qty": str(qty),
             "timeInForce": "GoodTillCancel"
         }
-        body_str = json.dumps(body)
+        body_str = json.dumps(body, separators=(',', ':'))
         headers = get_headers(body_str)
         r = requests.post(
             f"{BASE_URL}/v5/order/create",
             data=body_str,
             headers=headers,
-            timeout=10
+            timeout=15
         )
-        result = r.json()
+        result = json.loads(r.text)
         if result.get("retCode") == 0:
-            log(f"✅ Ordine {side} eseguito: {qty} {SYMBOL}")
+            log(f"Ordine {side} eseguito: {qty} {SYMBOL}")
             return True
         else:
-            log(f"❌ Errore ordine: {result.get('retMsg')}")
+            log(f"Errore ordine: {result.get('retMsg')}")
             return False
     except Exception as e:
         log(f"[ERRORE] Ordine: {e}")
@@ -154,9 +172,11 @@ def get_news():
                 "pageSize": 5,
                 "apiKey": NEWSAPI_KEY
             },
-            timeout=10
+            timeout=15
         )
-        articles = r.json().get("articles", [])
+        articles = json.loads(r.text).get("articles", [])
+        if not articles:
+            return "Nessuna news disponibile"
         return "\n".join([f"- {a['title']}" for a in articles[:5]])
     except Exception as e:
         log(f"[ERRORE] News: {e}")
@@ -165,8 +185,8 @@ def get_news():
 # ─── FEAR & GREED ────────────────────────────────────────────────────────────
 def get_fear_greed():
     try:
-        r = requests.get("https://api.alternative.me/fng/?limit=1", timeout=10)
-        data = r.json()["data"][0]
+        r = requests.get("https://api.alternative.me/fng/?limit=1", timeout=15)
+        data = json.loads(r.text)["data"][0]
         return f"{data['value']} ({data['value_classification']})"
     except:
         return "N/A"
@@ -174,31 +194,26 @@ def get_fear_greed():
 # ─── AI DECISION ─────────────────────────────────────────────────────────────
 def ai_decision(market, news, fear_greed, balance):
     try:
-        prompt = f"""Sei un AI trading agent esperto. Analizza e rispondi SOLO con un JSON.
-
-MERCATO {SYMBOL}:
-- Prezzo: ${market.get('price', 0):,.2f}
-- Variazione 24h: {market.get('change24h', 0)}%
-- RSI: {market.get('rsi', 50)}
-- MACD: {market.get('macd', 0)}
-- High 24h: ${market.get('high', 0):,.2f}
-- Low 24h: ${market.get('low', 0):,.2f}
-
-SENTIMENT:
-- Fear & Greed: {fear_greed}
-- News:
-{news}
-
-PORTAFOGLIO:
-- Bilancio USDT: ${balance:.2f}
-- Rischio per trade: {RISK_PCT*100}%
-- Stop Loss: {STOP_LOSS*100}%
-- Take Profit: {TAKE_PROFIT*100}%
-
-Rispondi SOLO con questo JSON (nient'altro):
-{{"action": "BUY", "reason": "motivo breve"}}
-oppure {{"action": "SELL", "reason": "motivo breve"}}
-oppure {{"action": "HOLD", "reason": "motivo breve"}}"""
+        prompt = (
+            f"Sei un AI trading agent esperto. Analizza e rispondi SOLO con un JSON.\n\n"
+            f"MERCATO {SYMBOL}:\n"
+            f"- Prezzo: ${market.get('price', 0)}\n"
+            f"- Variazione 24h: {market.get('change24h', 0)}%\n"
+            f"- RSI: {market.get('rsi', 50)}\n"
+            f"- MACD: {market.get('macd', 0)}\n"
+            f"- High 24h: ${market.get('high', 0)}\n"
+            f"- Low 24h: ${market.get('low', 0)}\n\n"
+            f"SENTIMENT:\n"
+            f"- Fear & Greed: {fear_greed}\n"
+            f"- News:\n{news}\n\n"
+            f"PORTAFOGLIO:\n"
+            f"- Bilancio USDT: ${balance}\n"
+            f"- Rischio per trade: {RISK_PCT*100}%\n\n"
+            f'Rispondi SOLO con uno di questi JSON:\n'
+            f'{{"action": "BUY", "reason": "motivo"}}\n'
+            f'{{"action": "SELL", "reason": "motivo"}}\n'
+            f'{{"action": "HOLD", "reason": "motivo"}}'
+        )
 
         r = requests.post(
             "https://api.anthropic.com/v1/messages",
@@ -214,7 +229,7 @@ oppure {{"action": "HOLD", "reason": "motivo breve"}}"""
             },
             timeout=30
         )
-        data = r.json()
+        data = json.loads(r.text)
         return data["content"][0]["text"].strip()
     except Exception as e:
         log(f"[ERRORE] AI: {e}")
@@ -222,13 +237,13 @@ oppure {{"action": "HOLD", "reason": "motivo breve"}}"""
 
 # ─── MAIN LOOP ───────────────────────────────────────────────────────────────
 def main():
-    log("🤖 AI Trading Bot avviato!")
-    log(f"   Simbolo: {SYMBOL} | Rischio: {RISK_PCT*100}% | SL: {STOP_LOSS*100}% | TP: {TAKE_PROFIT*100}%")
+    log("AI Trading Bot avviato!")
+    log(f"Simbolo: {SYMBOL} | Rischio: {RISK_PCT*100}% | SL: {STOP_LOSS*100}% | TP: {TAKE_PROFIT*100}%")
 
     while True:
         try:
-            log("─" * 50)
-            log("📊 Raccolta dati...")
+            log("--------------------------------------------------")
+            log("Raccolta dati...")
 
             market     = get_market_data()
             balance    = get_balance()
@@ -236,16 +251,16 @@ def main():
             fear_greed = get_fear_greed()
 
             if not market:
-                log("⚠️ Dati mercato non disponibili, riprovo tra 5 min")
+                log("Dati mercato non disponibili, riprovo tra 5 min")
                 time.sleep(300)
                 continue
 
-            log(f"💰 Prezzo: ${market['price']:,.2f} | RSI: {market['rsi']} | F&G: {fear_greed}")
-            log(f"💼 Bilancio: ${balance:.2f} USDT")
-            log("🧠 AI in analisi...")
+            log(f"Prezzo: ${market['price']} | RSI: {market['rsi']} | F&G: {fear_greed}")
+            log(f"Bilancio: ${balance} USDT")
+            log("AI in analisi...")
 
             raw = ai_decision(market, news, fear_greed, balance)
-            log(f"🤖 Risposta AI: {raw}")
+            log(f"Risposta AI: {raw}")
 
             try:
                 start = raw.find("{")
@@ -253,23 +268,23 @@ def main():
                 decision = json.loads(raw[start:end])
                 action = decision.get("action", "HOLD")
                 reason = decision.get("reason", "")
-                log(f"✅ Azione: {action} | Motivo: {reason}")
+                log(f"Azione: {action} | Motivo: {reason}")
 
                 if action == "BUY" and balance >= 10:
                     place_order("Buy", market["price"], balance)
                 elif action == "SELL" and balance >= 10:
                     place_order("Sell", market["price"], balance)
                 else:
-                    log("⏸️  HOLD — nessuna operazione")
+                    log("HOLD - nessuna operazione")
 
             except Exception as e:
-                log(f"⚠️ Errore parsing: {e}")
+                log(f"Errore parsing AI: {e}")
 
-            log(f"⏰ Prossima analisi tra {INTERVAL//60} minuti")
+            log(f"Prossima analisi tra {INTERVAL//60} minuti")
             time.sleep(INTERVAL)
 
         except KeyboardInterrupt:
-            log("🛑 Bot fermato.")
+            log("Bot fermato.")
             break
         except Exception as e:
             log(f"[ERRORE CRITICO] {e}")
