@@ -44,18 +44,44 @@ def get_market_data():
         log(f"[ERRORE] Mercato: {e}")
         return {}
 
+def bybit_request(method, endpoint, params=None, body=None):
+    """Firma e invia richieste a Bybit V5"""
+    ts = str(int(time.time() * 1000))
+    recv_window = "5000"
+    
+    if method == "GET":
+        query_string = "&".join([f"{k}={v}" for k, v in sorted(params.items())]) if params else ""
+        sign_payload = ts + BYBIT_API_KEY + recv_window + query_string
+    else:
+        body_str = json.dumps(body, separators=(',', ':')) if body else ""
+        sign_payload = ts + BYBIT_API_KEY + recv_window + body_str
+
+    sig = hmac.new(
+        BYBIT_API_SECRET.encode("utf-8"),
+        sign_payload.encode("utf-8"),
+        hashlib.sha256
+    ).hexdigest()
+
+    headers = {
+        "X-BAPI-API-KEY": BYBIT_API_KEY,
+        "X-BAPI-TIMESTAMP": ts,
+        "X-BAPI-SIGN": sig,
+        "X-BAPI-RECV-WINDOW": recv_window,
+        "Content-Type": "application/json"
+    }
+
+    url = f"https://api.bybit.com{endpoint}"
+    if method == "GET":
+        r = requests.get(url, params=params, headers=headers, timeout=15)
+    else:
+        r = requests.post(url, data=json.dumps(body, separators=(',', ':')), headers=headers, timeout=15)
+    
+    return r.json()
+
 def get_balance():
     try:
-        ts = str(int(time.time() * 1000))
-        recv_window = "5000"
-        query = "accountType=UNIFIED"
-        sign_str = ts + BYBIT_API_KEY + recv_window + query
-        sig = hmac.new(BYBIT_API_SECRET.encode(), sign_str.encode(), hashlib.sha256).hexdigest()
-        headers = {"X-BAPI-API-KEY": BYBIT_API_KEY, "X-BAPI-TIMESTAMP": ts,
-                   "X-BAPI-SIGN": sig, "X-BAPI-RECV-WINDOW": recv_window}
-        r = requests.get("https://api.bybit.com/v5/account/wallet-balance",
-                         params={"accountType": "UNIFIED"}, headers=headers, timeout=15)
-        data = r.json()
+        data = bybit_request("GET", "/v5/account/wallet-balance", params={"accountType": "UNIFIED"})
+        log(f"DEBUG Bilancio risposta: {str(data)[:200]}")
         if data.get("retCode") == 0:
             coins = data["result"]["list"][0]["coin"]
             usdt = next((c for c in coins if c["coin"] == "USDT"), None)
@@ -63,28 +89,18 @@ def get_balance():
             log(f"Bilancio: ${bal} USDT")
             return bal
         else:
-            log(f"Bilancio errore: {data.get('retMsg')} - uso valore default")
-            return 500.0
+            log(f"Bilancio errore code {data.get('retCode')}: {data.get('retMsg')}")
+            return 0.0
     except Exception as e:
-        log(f"[ERRORE] Bilancio: {e} - uso valore default")
-        return 500.0
+        log(f"[ERRORE] Bilancio: {e}")
+        return 0.0
 
 def place_order(side, price, balance):
     try:
         qty = round((balance * RISK_PCT) / price, 6)
         body = {"category": "spot", "symbol": SYMBOL, "side": side,
                 "orderType": "Market", "qty": str(qty), "timeInForce": "GoodTillCancel"}
-        body_str = json.dumps(body, separators=(',', ':'))
-        ts = str(int(time.time() * 1000))
-        recv_window = "5000"
-        sign_str = ts + BYBIT_API_KEY + recv_window + body_str
-        sig = hmac.new(BYBIT_API_SECRET.encode(), sign_str.encode(), hashlib.sha256).hexdigest()
-        headers = {"X-BAPI-API-KEY": BYBIT_API_KEY, "X-BAPI-TIMESTAMP": ts,
-                   "X-BAPI-SIGN": sig, "X-BAPI-RECV-WINDOW": recv_window,
-                   "Content-Type": "application/json"}
-        r = requests.post("https://api.bybit.com/v5/order/create",
-                          data=body_str, headers=headers, timeout=15)
-        result = r.json()
+        result = bybit_request("POST", "/v5/order/create", body=body)
         if result.get("retCode") == 0:
             log(f"Ordine {side} eseguito: {qty} BTC")
         else:
@@ -126,22 +142,15 @@ def ai_decision(market, news, fear_greed, balance):
         )
         r = requests.post(
             "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key": ANTHROPIC_KEY,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json"
-            },
-            json={
-                "model": "claude-haiku-4-5-20251001",
-                "max_tokens": 150,
-                "messages": [{"role": "user", "content": prompt}]
-            },
+            headers={"x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01",
+                     "content-type": "application/json"},
+            json={"model": "claude-haiku-4-5-20251001", "max_tokens": 150,
+                  "messages": [{"role": "user", "content": prompt}]},
             timeout=30
         )
         resp = r.json()
-        log(f"DEBUG API risposta: {str(resp)[:300]}")
         if "content" not in resp:
-            log(f"ERRORE API: {resp.get('error', resp)}")
+            log(f"ERRORE API Anthropic: {resp.get('error', resp)}")
             return {"action": "HOLD", "reason": "Errore API"}
         text = resp["content"][0]["text"].strip()
         start = text.find("{")
@@ -154,7 +163,6 @@ def ai_decision(market, news, fear_greed, balance):
 def main():
     log("AI Trading Bot avviato!")
     log(f"Simbolo: {SYMBOL} | Rischio: {RISK_PCT*100}% | Intervallo: {INTERVAL//60}min")
-    log(f"Chiave Anthropic (primi 20 char): {ANTHROPIC_KEY[:20]}...")
 
     while True:
         try:
