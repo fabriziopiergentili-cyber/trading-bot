@@ -1,1 +1,2 @@
 requests==2.31.0
+eth-account==0.10.0
