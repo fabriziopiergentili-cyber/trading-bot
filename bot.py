@@ -19,8 +19,8 @@ MAX_RISK  = 0.05
 SL_PCT    = 0.015
 TP_PCT    = 0.03
 TRAIL_PCT = 0.0266
-INTERVAL  = 3600      # Analisi ogni 60 minuti
-MONITOR   = 300       # Monitoraggio posizioni ogni 5 minuti
+INTERVAL  = 3600
+MONITOR   = 300
 
 HL_URL = "https://api.hyperliquid.xyz"
 
@@ -95,7 +95,7 @@ def get_price():
 # ─── HYPERLIQUID: CHIUDI POSIZIONE ───────────────────────────────────────────
 def close_position(size, price, is_long):
     try:
-        side = not is_long  # Se long, chiudi con sell; se short, chiudi con buy
+        side = not is_long
         action = {
             "type": "order",
             "orders": [{
@@ -103,7 +103,7 @@ def close_position(size, price, is_long):
                 "b": side,
                 "p": str(round(price * (0.995 if side else 1.005), 2)),
                 "s": str(abs(size)),
-                "r": True,  # reduce only
+                "r": True,
                 "t": {"limit": {"tif": "Ioc"}},
                 "c": ""
             }],
@@ -123,48 +123,45 @@ def close_position(size, price, is_long):
         return False
 
 # ─── MONITORAGGIO POSIZIONI ───────────────────────────────────────────────────
+# Returns True if a position was closed (triggers immediate re-analysis)
 def monitor_positions():
     positions = get_positions()
     if not positions:
-        return
+        return False
 
     price = get_price()
     if price == 0:
-        return
+        return False
+
+    position_closed = False
 
     for pos in positions:
-        entry  = pos["entry"]
-        size   = pos["size"]
-        pnl    = pos["pnl"]
+        entry   = pos["entry"]
+        size    = pos["size"]
+        pnl     = pos["pnl"]
         is_long = pos["side"] == "LONG"
 
-        # Calcola SL e TP
         sl = entry * (1 - SL_PCT) if is_long else entry * (1 + SL_PCT)
         tp = entry * (1 + TP_PCT) if is_long else entry * (1 - TP_PCT)
-        trail_sl = entry * (1 - TRAIL_PCT) if is_long else entry * (1 + TRAIL_PCT)
 
         log(f"Posizione {pos['side']} {pos['coin']} | Entry: ${entry:,.2f} | PnL: ${pnl:.2f}")
         log(f"Prezzo: ${price:,.2f} | SL: ${sl:,.2f} | TP: ${tp:,.2f}")
 
-        # Controlla Stop Loss
-        if is_long and price <= sl:
-            log(f"STOP LOSS scattato! Prezzo ${price:,.2f} <= SL ${sl:,.2f}")
-            close_position(size, price, is_long)
+        # Stop Loss
+        if (is_long and price <= sl) or (not is_long and price >= sl):
+            log(f"STOP LOSS scattato! Prezzo ${price:,.2f}")
+            closed = close_position(size, price, is_long)
+            if closed:
+                position_closed = True
 
-        elif not is_long and price >= sl:
-            log(f"STOP LOSS scattato! Prezzo ${price:,.2f} >= SL ${sl:,.2f}")
-            close_position(size, price, is_long)
+        # Take Profit
+        elif (is_long and price >= tp) or (not is_long and price <= tp):
+            log(f"TAKE PROFIT raggiunto! Prezzo ${price:,.2f}")
+            closed = close_position(size, price, is_long)
+            if closed:
+                position_closed = True
 
-        # Controlla Take Profit
-        elif is_long and price >= tp:
-            log(f"TAKE PROFIT raggiunto! Prezzo ${price:,.2f} >= TP ${tp:,.2f}")
-            close_position(size, price, is_long)
-
-        elif not is_long and price <= tp:
-            log(f"TAKE PROFIT raggiunto! Prezzo ${price:,.2f} <= TP ${tp:,.2f}")
-            close_position(size, price, is_long)
-
-        # Trailing stop — se in profitto del 2%, sposta SL
+        # Trailing stop
         elif is_long and price >= entry * 1.02:
             new_sl = price * (1 - TRAIL_PCT)
             if new_sl > sl:
@@ -178,7 +175,9 @@ def monitor_positions():
         else:
             log(f"Posizione in corso — nessuna azione necessaria")
 
-# ─── DATI MERCATO + INDICATORI ────────────────────────────────────────────────
+    return position_closed
+
+# ─── DATI MERCATO ─────────────────────────────────────────────────────────────
 def get_market_data():
     try:
         r = requests.post(f"{HL_URL}/info", json={"type": "allMids"}, timeout=15)
@@ -210,10 +209,9 @@ def get_market_data():
         ema20  = round(sum(closes[-20:]) / 20, 2) if len(closes) >= 20 else price
         ema200 = round(sum(closes[-200:]) / 200, 2) if len(closes) >= 200 else price
 
-        bb_period = 20
-        bb_closes = closes[-bb_period:]
-        bb_mean   = sum(bb_closes) / bb_period
-        bb_std    = math.sqrt(sum((x - bb_mean)**2 for x in bb_closes) / bb_period)
+        bb_closes = closes[-20:]
+        bb_mean   = sum(bb_closes) / 20
+        bb_std    = math.sqrt(sum((x - bb_mean)**2 for x in bb_closes) / 20)
         bb_upper  = round(bb_mean + 2 * bb_std, 2)
         bb_lower  = round(bb_mean - 2 * bb_std, 2)
         bb_mid    = round(bb_mean, 2)
@@ -227,28 +225,22 @@ def get_market_data():
         r2    = round(pivot + (last_high - last_low), 2)
         s2    = round(pivot - (last_high - last_low), 2)
 
-        trs = []
-        for i in range(1, min(15, len(closes))):
-            tr = max(highs[-i] - lows[-i],
-                    abs(highs[-i] - closes[-i-1]),
-                    abs(lows[-i] - closes[-i-1]))
-            trs.append(tr)
+        trs = [max(highs[-i]-lows[-i], abs(highs[-i]-closes[-i-1]), abs(lows[-i]-closes[-i-1]))
+               for i in range(1, min(15, len(closes)))]
         atr = round(sum(trs) / len(trs), 2) if trs else 0
 
         try:
-            r3 = requests.post(f"{HL_URL}/info",
-                              json={"type": "l2Book", "coin": SYMBOL},
-                              timeout=15)
-            book = r3.json()
-            bids = book.get("levels", [[]])[0][:5]
-            asks = book.get("levels", [[]])[1][:5]
+            r3 = requests.post(f"{HL_URL}/info", json={"type": "l2Book", "coin": SYMBOL}, timeout=15)
+            book    = r3.json()
+            bids    = book.get("levels", [[]])[0][:5]
+            asks    = book.get("levels", [[]])[1][:5]
             bid_vol = sum(float(b["sz"]) for b in bids)
             ask_vol = sum(float(a["sz"]) for a in asks)
-            order_book = f"Bid: {bid_vol:.2f} BTC | Ask: {ask_vol:.2f} BTC | Ratio: {round(bid_vol/ask_vol, 2) if ask_vol > 0 else 'N/A'}"
+            order_book = f"Bid: {bid_vol:.2f} | Ask: {ask_vol:.2f} | Ratio: {round(bid_vol/ask_vol,2) if ask_vol>0 else 'N/A'}"
         except:
             order_book = "N/A"
 
-        change24h = round(((price - closes[-25]) / closes[-25]) * 100, 2) if len(closes) >= 25 else 0
+        change24h   = round(((price - closes[-25]) / closes[-25]) * 100, 2) if len(closes) >= 25 else 0
         trend_short = "RIALZISTA" if closes[-1] > closes[-10] else "RIBASSISTA"
         trend_mid   = "RIALZISTA" if closes[-1] > closes[-50] else "RIBASSISTA"
         momentum    = round(((closes[-1] - closes[-10]) / closes[-10]) * 100, 2)
@@ -271,12 +263,10 @@ def get_market_data():
         log(f"[ERRORE] Mercato: {e}")
         return {}
 
-# ─── ALTRI DATI ───────────────────────────────────────────────────────────────
 def get_oi_funding():
     try:
         r = requests.post(f"{HL_URL}/info", json={"type": "metaAndAssetCtxs"}, timeout=15)
-        data = r.json()
-        btc_ctx = data[1][0]
+        btc_ctx = r.json()[1][0]
         oi      = float(btc_ctx.get("openInterest", 0))
         funding = float(btc_ctx.get("funding", 0)) * 100
         return f"OI: {oi:,.0f} BTC | Funding: {funding:.4f}%"
@@ -319,8 +309,7 @@ def get_whale_alert():
 # ─── ORDINE ───────────────────────────────────────────────────────────────────
 def place_order(side, price, balance):
     try:
-        risk   = min(RISK_PCT, MAX_RISK)
-        size   = round((balance * risk * LEVERAGE) / price, 4)
+        size   = round((balance * min(RISK_PCT, MAX_RISK) * LEVERAGE) / price, 4)
         is_buy = side == "BUY"
         sl     = round(price * (1 - SL_PCT) if is_buy else price * (1 + SL_PCT), 2)
         tp     = round(price * (1 + TP_PCT) if is_buy else price * (1 - TP_PCT), 2)
@@ -328,24 +317,16 @@ def place_order(side, price, balance):
         action = {
             "type": "order",
             "orders": [{
-                "a": 0,
-                "b": is_buy,
-                "p": str(price),
-                "s": str(size),
-                "r": False,
-                "t": {"limit": {"tif": "Gtc"}},
-                "c": ""
+                "a": 0, "b": is_buy, "p": str(price), "s": str(size),
+                "r": False, "t": {"limit": {"tif": "Gtc"}}, "c": ""
             }],
             "grouping": "na"
         }
-
         payload = hl_sign(action)
         r = requests.post(f"{HL_URL}/exchange", json=payload, timeout=15)
-        result = r.json()
-
+        result  = r.json()
         if result.get("status") == "ok":
-            log(f"Ordine {side} eseguito: {size} BTC @ ${price:,.2f}")
-            log(f"SL: ${sl:,.2f} | TP: ${tp:,.2f} | Trailing: {TRAIL_PCT*100}%")
+            log(f"Ordine {side}: {size} BTC @ ${price:,.2f} | SL: ${sl:,.2f} | TP: ${tp:,.2f}")
             return True
         else:
             log(f"Errore ordine: {result}")
@@ -363,23 +344,19 @@ def ai_decision(market, news, fear_greed, whale, oi_funding, balance, positions)
 
         prompt = (
             f"Sei un AI trading agent esperto su Hyperliquid. Analizza TUTTI i dati.\n\n"
-            f"═══ PREZZO ═══\n"
             f"BTC: ${market.get('price'):,.2f} | 24h: {market.get('change24h')}%\n"
-            f"High: ${market.get('high'):,.2f} | Low: ${market.get('low'):,.2f}\n\n"
-            f"═══ INDICATORI ═══\n"
             f"RSI: {market.get('rsi')} | MACD: {market.get('macd')}\n"
             f"EMA20: ${market.get('ema20'):,.2f} | EMA200: ${market.get('ema200'):,.2f}\n"
             f"BB Upper: ${market.get('bb_upper'):,.2f} | Lower: ${market.get('bb_lower'):,.2f}\n"
             f"Pivot: {market.get('pivot')} | R1: {market.get('r1')} | S1: {market.get('s1')}\n"
-            f"ATR: {market.get('atr')} | {market.get('order_book')}\n\n"
-            f"═══ FORECAST ═══\n{market.get('forecast')}\n\n"
-            f"═══ DERIVATI ═══\n{oi_funding}\n\n"
-            f"═══ SENTIMENT ═══\nFear&Greed: {fear_greed}\n\n"
-            f"═══ WHALE ═══\n{whale}\n\n"
-            f"═══ NEWS ═══\n{news}\n\n"
-            f"═══ PORTAFOGLIO ═══\n"
+            f"ATR: {market.get('atr')} | {market.get('order_book')}\n"
+            f"Forecast: {market.get('forecast')}\n"
+            f"{oi_funding}\n"
+            f"Fear&Greed: {fear_greed}\n"
+            f"Whale: {whale}\n"
+            f"News:\n{news}\n\n"
             f"Bilancio: ${balance:.2f} USDC | Leva: {LEVERAGE}x\n"
-            f"Posizioni aperte:\n{pos_str}\n\n"
+            f"Posizioni:\n{pos_str}\n"
             f"SL: {SL_PCT*100}% | TP: {TP_PCT*100}% | Trailing: {TRAIL_PCT*100}%\n\n"
             "Rispondi SOLO con uno di questi JSON:\n"
             '{"action":"BUY","reason":"motivo"}\n'
@@ -392,8 +369,7 @@ def ai_decision(market, news, fear_greed, whale, oi_funding, balance, positions)
             headers={"x-api-key": ANTHROPIC_KEY,
                      "anthropic-version": "2023-06-01",
                      "content-type": "application/json"},
-            json={"model": "claude-haiku-4-5-20251001",
-                  "max_tokens": 400,
+            json={"model": "claude-haiku-4-5-20251001", "max_tokens": 400,
                   "messages": [{"role": "user", "content": prompt}]},
             timeout=30
         )
@@ -414,7 +390,7 @@ def main():
     log(f"Analisi ogni {INTERVAL//60} min | Monitoraggio ogni {MONITOR//60} min")
     log(f"SL: {SL_PCT*100}% | TP: {TP_PCT*100}% | Trailing: {TRAIL_PCT*100}%")
 
-    last_analysis = 0
+    last_analysis = 0  # Forza analisi immediata all'avvio
 
     while True:
         try:
@@ -422,9 +398,14 @@ def main():
 
             # ── MONITORAGGIO POSIZIONI (ogni 5 minuti) ──
             log("--- Monitoraggio posizioni ---")
-            monitor_positions()
+            position_closed = monitor_positions()
 
-            # ── ANALISI COMPLETA (ogni 60 minuti) ──
+            # Se una posizione è stata chiusa → analisi immediata
+            if position_closed:
+                log("Posizione chiusa! Avvio analisi immediata...")
+                last_analysis = 0
+
+            # ── ANALISI COMPLETA (ogni 60 minuti o su trigger) ──
             if now - last_analysis >= INTERVAL:
                 log("=" * 60)
                 log("ANALISI COMPLETA")
@@ -439,6 +420,7 @@ def main():
 
                 if not market:
                     log("Dati non disponibili, riprovo tra 5 min")
+                    # Non aggiornare last_analysis → riprova al prossimo ciclo
                 else:
                     log(f"Fear&Greed: {fear_greed}")
                     log("AI in analisi...")
@@ -449,18 +431,26 @@ def main():
                     log(f"Motivo: {reason}")
 
                     if action == "BUY" and balance >= 10 and not positions:
-                        place_order("BUY", market["price"], balance)
+                        success = place_order("BUY", market["price"], balance)
+                        if success:
+                            last_analysis = now  # Aspetta 1h prima di prossima analisi
+                        # Se fallisce → last_analysis rimane 0 → riprova subito
+
                     elif action == "SELL" and balance >= 10 and not positions:
-                        place_order("SELL", market["price"], balance)
+                        success = place_order("SELL", market["price"], balance)
+                        if success:
+                            last_analysis = now
+                        # Se fallisce → riprova subito
+
                     else:
+                        # HOLD → non aggiornare last_analysis → rianalizza al prossimo ciclo
+                        log("HOLD - nessuna operazione")
                         if positions:
-                            log("Posizione già aperta — nessun nuovo ordine")
-                        else:
-                            log("HOLD - nessuna operazione")
+                            log("Posizione già aperta — monitoriamo")
+                            last_analysis = now  # Con posizione aperta, aspetta 1h
+                        # Senza posizione e HOLD → rianalizza tra 5 min (prossimo monitor)
 
-                last_analysis = now
-
-            log(f"Prossimo monitoraggio tra {MONITOR//60} minuti")
+            log(f"Prossimo ciclo tra {MONITOR//60} minuti")
             time.sleep(MONITOR)
 
         except KeyboardInterrupt:
