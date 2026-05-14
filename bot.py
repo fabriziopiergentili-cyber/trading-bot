@@ -10,6 +10,7 @@ from eth_account.messages import encode_defunct
 # ─── CONFIGURAZIONE ───────────────────────────────────────────────────────────
 ANTHROPIC_KEY    = os.environ.get("ANTHROPIC_API_KEY", "")
 HYPERLIQUID_KEY  = os.environ.get("HYPERLIQUID_PRIVATE_KEY", "")
+HYPERLIQUID_ADDR = os.environ.get("HYPERLIQUID_ADDRESS", "")  # Wallet address su Hyperliquid
 NEWSAPI_KEY      = os.environ.get("NEWSAPI_KEY", "")
 
 SYMBOL    = "BTC"
@@ -31,28 +32,28 @@ def log(msg):
 
 # ─── HYPERLIQUID: FIRMA ───────────────────────────────────────────────────────
 def hl_sign(action):
-    account = Account.from_key(HYPERLIQUID_KEY)
+    account   = Account.from_key(HYPERLIQUID_KEY)
     timestamp = int(time.time() * 1000)
-    payload = json.dumps({"action": action, "nonce": timestamp}, separators=(',', ':'))
-    msg = encode_defunct(text=payload)
-    signed = account.sign_message(msg)
+    payload   = json.dumps({"action": action, "nonce": timestamp}, separators=(',', ':'))
+    msg       = encode_defunct(text=payload)
+    signed    = account.sign_message(msg)
     return {
         "action": action,
         "nonce": timestamp,
         "signature": {"r": hex(signed.r), "s": hex(signed.s), "v": signed.v}
     }
 
-# ─── HYPERLIQUID: BILANCIO ────────────────────────────────────────────────────
+# ─── HYPERLIQUID: BILANCIO SPOT ──────────────────────────────────────────────
 def get_balance():
     try:
-        account = Account.from_key(HYPERLIQUID_KEY)
-        address = account.address
-        r = requests.post(f"{HL_URL}/info",
-                         json={"type": "clearinghouseState", "user": address},
-                         timeout=15)
+        r    = requests.post(f"{HL_URL}/info",
+                             json={"type": "spotClearinghouseState", "user": HYPERLIQUID_ADDR},
+                             timeout=15)
         data = r.json()
-        balance = float(data.get("marginSummary", {}).get("accountValue", 0))
-        log(f"Bilancio: ${balance:.2f} USDC")
+        balances = data.get("balances", [])
+        usdc = next((b for b in balances if b["coin"] == "USDC"), None)
+        balance = float(usdc["total"]) if usdc else 0.0
+        log(f"Bilancio USDC: ${balance:.2f}")
         return balance
     except Exception as e:
         log(f"[ERRORE] Bilancio: {e}")
@@ -61,23 +62,21 @@ def get_balance():
 # ─── HYPERLIQUID: POSIZIONI APERTE ───────────────────────────────────────────
 def get_positions():
     try:
-        account = Account.from_key(HYPERLIQUID_KEY)
-        address = account.address
-        r = requests.post(f"{HL_URL}/info",
-                         json={"type": "clearinghouseState", "user": address},
-                         timeout=15)
+        r    = requests.post(f"{HL_URL}/info",
+                             json={"type": "clearinghouseState", "user": HYPERLIQUID_ADDR},
+                             timeout=15)
         data = r.json()
         positions = []
         for pos in data.get("assetPositions", []):
-            p = pos.get("position", {})
+            p    = pos.get("position", {})
             size = float(p.get("szi", 0))
             if size != 0:
                 positions.append({
-                    "coin": p.get("coin"),
-                    "size": size,
+                    "coin":  p.get("coin"),
+                    "size":  size,
                     "entry": float(p.get("entryPx", 0)),
-                    "pnl": float(p.get("unrealizedPnl", 0)),
-                    "side": "LONG" if size > 0 else "SHORT"
+                    "pnl":   float(p.get("unrealizedPnl", 0)),
+                    "side":  "LONG" if size > 0 else "SHORT"
                 })
         return positions
     except Exception as e:
@@ -95,7 +94,7 @@ def get_price():
 # ─── HYPERLIQUID: CHIUDI POSIZIONE ───────────────────────────────────────────
 def close_position(size, price, is_long):
     try:
-        side = not is_long
+        side   = not is_long
         action = {
             "type": "order",
             "orders": [{
@@ -110,10 +109,10 @@ def close_position(size, price, is_long):
             "grouping": "na"
         }
         payload = hl_sign(action)
-        r = requests.post(f"{HL_URL}/exchange", json=payload, timeout=15)
-        result = r.json()
+        r       = requests.post(f"{HL_URL}/exchange", json=payload, timeout=15)
+        result  = r.json()
         if result.get("status") == "ok":
-            log(f"Posizione chiusa con successo!")
+            log("Posizione chiusa con successo!")
             return True
         else:
             log(f"Errore chiusura: {result}")
@@ -123,8 +122,8 @@ def close_position(size, price, is_long):
         return False
 
 # ─── MONITORAGGIO POSIZIONI ───────────────────────────────────────────────────
-# Returns True if a position was closed (triggers immediate re-analysis)
 def monitor_positions():
+    """Returns True if a position was closed (triggers immediate re-analysis)"""
     positions = get_positions()
     if not positions:
         return False
@@ -147,21 +146,16 @@ def monitor_positions():
         log(f"Posizione {pos['side']} {pos['coin']} | Entry: ${entry:,.2f} | PnL: ${pnl:.2f}")
         log(f"Prezzo: ${price:,.2f} | SL: ${sl:,.2f} | TP: ${tp:,.2f}")
 
-        # Stop Loss
         if (is_long and price <= sl) or (not is_long and price >= sl):
             log(f"STOP LOSS scattato! Prezzo ${price:,.2f}")
-            closed = close_position(size, price, is_long)
-            if closed:
+            if close_position(size, price, is_long):
                 position_closed = True
 
-        # Take Profit
         elif (is_long and price >= tp) or (not is_long and price <= tp):
             log(f"TAKE PROFIT raggiunto! Prezzo ${price:,.2f}")
-            closed = close_position(size, price, is_long)
-            if closed:
+            if close_position(size, price, is_long):
                 position_closed = True
 
-        # Trailing stop
         elif is_long and price >= entry * 1.02:
             new_sl = price * (1 - TRAIL_PCT)
             if new_sl > sl:
@@ -173,21 +167,21 @@ def monitor_positions():
                 log(f"Trailing stop aggiornato: ${new_sl:,.2f}")
 
         else:
-            log(f"Posizione in corso — nessuna azione necessaria")
+            log("Posizione in corso — nessuna azione necessaria")
 
     return position_closed
 
 # ─── DATI MERCATO ─────────────────────────────────────────────────────────────
 def get_market_data():
     try:
-        r = requests.post(f"{HL_URL}/info", json={"type": "allMids"}, timeout=15)
+        r     = requests.post(f"{HL_URL}/info", json={"type": "allMids"}, timeout=15)
         price = float(r.json().get("BTC", 0))
 
-        r2 = requests.post(f"{HL_URL}/info",
-                          json={"type": "candleSnapshot",
-                                "req": {"coin": SYMBOL, "interval": "1h",
-                                        "startTime": int(time.time()*1000) - 86400000*8}},
-                          timeout=15)
+        r2      = requests.post(f"{HL_URL}/info",
+                                json={"type": "candleSnapshot",
+                                      "req": {"coin": SYMBOL, "interval": "1h",
+                                              "startTime": int(time.time()*1000) - 86400000*8}},
+                                timeout=15)
         candles = r2.json()
         closes  = [float(c["c"]) for c in candles]
         highs   = [float(c["h"]) for c in candles]
@@ -202,12 +196,11 @@ def get_market_data():
         avg_g  = sum(gains[-14:]) / 14
         avg_l  = sum(losses[-14:]) / 14
         rsi    = round(100 - (100 / (1 + avg_g / avg_l)), 2) if avg_l != 0 else 50
-
         ema12  = sum(closes[-12:]) / 12
         ema26  = sum(closes[-26:]) / 26
         macd   = round(ema12 - ema26, 2)
-        ema20  = round(sum(closes[-20:]) / 20, 2) if len(closes) >= 20 else price
-        ema200 = round(sum(closes[-200:]) / 200, 2) if len(closes) >= 200 else price
+        ema20  = round(sum(closes[-20:]) / 20, 2)
+        ema200 = round(sum(closes[-200:]) / 200, 2) if len(closes) >= 200 else round(sum(closes) / len(closes), 2)
 
         bb_closes = closes[-20:]
         bb_mean   = sum(bb_closes) / 20
@@ -230,7 +223,7 @@ def get_market_data():
         atr = round(sum(trs) / len(trs), 2) if trs else 0
 
         try:
-            r3 = requests.post(f"{HL_URL}/info", json={"type": "l2Book", "coin": SYMBOL}, timeout=15)
+            r3      = requests.post(f"{HL_URL}/info", json={"type": "l2Book", "coin": SYMBOL}, timeout=15)
             book    = r3.json()
             bids    = book.get("levels", [[]])[0][:5]
             asks    = book.get("levels", [[]])[1][:5]
@@ -265,7 +258,7 @@ def get_market_data():
 
 def get_oi_funding():
     try:
-        r = requests.post(f"{HL_URL}/info", json={"type": "metaAndAssetCtxs"}, timeout=15)
+        r       = requests.post(f"{HL_URL}/info", json={"type": "metaAndAssetCtxs"}, timeout=15)
         btc_ctx = r.json()[1][0]
         oi      = float(btc_ctx.get("openInterest", 0))
         funding = float(btc_ctx.get("funding", 0)) * 100
@@ -275,11 +268,11 @@ def get_oi_funding():
 
 def get_news():
     try:
-        r = requests.get("https://newsapi.org/v2/everything",
-                         params={"q": "bitcoin crypto elon musk trump",
-                                 "language": "en", "sortBy": "publishedAt",
-                                 "pageSize": 8, "apiKey": NEWSAPI_KEY},
-                         timeout=15)
+        r        = requests.get("https://newsapi.org/v2/everything",
+                                params={"q": "bitcoin crypto elon musk trump",
+                                        "language": "en", "sortBy": "publishedAt",
+                                        "pageSize": 8, "apiKey": NEWSAPI_KEY},
+                                timeout=15)
         articles = r.json().get("articles", [])
         return "\n".join([f"- {a['title']}" for a in articles[:8]]) or "Nessuna news"
     except:
@@ -295,14 +288,15 @@ def get_fear_greed():
 
 def get_whale_alert():
     try:
-        r = requests.get("https://api.whale-alert.io/v1/transactions",
-                        params={"api_key": "free", "min_value": 1000000,
-                                "start": int(time.time()) - 3600, "limit": 5},
-                        timeout=10)
+        r   = requests.get("https://api.whale-alert.io/v1/transactions",
+                           params={"api_key": "free", "min_value": 1000000,
+                                   "start": int(time.time()) - 3600, "limit": 5},
+                           timeout=10)
         txs = r.json().get("transactions", [])
         if not txs:
             return "Nessun movimento balena"
-        return "\n".join([f"- {t.get('blockchain')}: {t.get('amount',0):,.0f} {t.get('symbol')} (${t.get('amount_usd',0):,.0f})" for t in txs[:3]])
+        return "\n".join([f"- {t.get('blockchain')}: {t.get('amount',0):,.0f} {t.get('symbol')} (${t.get('amount_usd',0):,.0f})"
+                          for t in txs[:3]])
     except:
         return "Whale Alert N/A"
 
@@ -312,7 +306,7 @@ def place_order(side, price, balance):
         size   = round((balance * min(RISK_PCT, MAX_RISK) * LEVERAGE) / price, 4)
         is_buy = side == "BUY"
         sl     = round(price * (1 - SL_PCT) if is_buy else price * (1 + SL_PCT), 2)
-        tp     = round(price * (1 + TP_PCT) if is_buy else price * (1 - TP_PCT), 2)
+        tp     = round(price * (1 + TP_PCT)  if is_buy else price * (1 - TP_PCT),  2)
 
         action = {
             "type": "order",
@@ -323,7 +317,7 @@ def place_order(side, price, balance):
             "grouping": "na"
         }
         payload = hl_sign(action)
-        r = requests.post(f"{HL_URL}/exchange", json=payload, timeout=15)
+        r       = requests.post(f"{HL_URL}/exchange", json=payload, timeout=15)
         result  = r.json()
         if result.get("status") == "ok":
             log(f"Ordine {side}: {size} BTC @ ${price:,.2f} | SL: ${sl:,.2f} | TP: ${tp:,.2f}")
@@ -340,7 +334,10 @@ def ai_decision(market, news, fear_greed, whale, oi_funding, balance, positions)
     try:
         pos_str = "Nessuna posizione aperta"
         if positions:
-            pos_str = "\n".join([f"- {p['side']} {p['coin']}: size={p['size']}, entry=${p['entry']:,.2f}, PnL=${p['pnl']:.2f}" for p in positions])
+            pos_str = "\n".join([
+                f"- {p['side']} {p['coin']}: size={p['size']}, entry=${p['entry']:,.2f}, PnL=${p['pnl']:.2f}"
+                for p in positions
+            ])
 
         prompt = (
             f"Sei un AI trading agent esperto su Hyperliquid. Analizza TUTTI i dati.\n\n"
@@ -364,7 +361,7 @@ def ai_decision(market, news, fear_greed, whale, oi_funding, balance, positions)
             '{"action":"HOLD","reason":"motivo"}'
         )
 
-        r = requests.post(
+        r    = requests.post(
             "https://api.anthropic.com/v1/messages",
             headers={"x-api-key": ANTHROPIC_KEY,
                      "anthropic-version": "2023-06-01",
@@ -387,6 +384,7 @@ def ai_decision(market, news, fear_greed, whale, oi_funding, balance, positions)
 # ─── MAIN LOOP ───────────────────────────────────────────────────────────────
 def main():
     log("AI Trading Bot su Hyperliquid avviato!")
+    log(f"Indirizzo wallet: {HYPERLIQUID_ADDR}")
     log(f"Analisi ogni {INTERVAL//60} min | Monitoraggio ogni {MONITOR//60} min")
     log(f"SL: {SL_PCT*100}% | TP: {TP_PCT*100}% | Trailing: {TRAIL_PCT*100}%")
 
@@ -400,12 +398,12 @@ def main():
             log("--- Monitoraggio posizioni ---")
             position_closed = monitor_positions()
 
-            # Se una posizione è stata chiusa → analisi immediata
+            # Posizione chiusa → analisi immediata
             if position_closed:
                 log("Posizione chiusa! Avvio analisi immediata...")
                 last_analysis = 0
 
-            # ── ANALISI COMPLETA (ogni 60 minuti o su trigger) ──
+            # ── ANALISI COMPLETA ──
             if now - last_analysis >= INTERVAL:
                 log("=" * 60)
                 log("ANALISI COMPLETA")
@@ -420,7 +418,7 @@ def main():
 
                 if not market:
                     log("Dati non disponibili, riprovo tra 5 min")
-                    # Non aggiornare last_analysis → riprova al prossimo ciclo
+                    # Non aggiorno last_analysis → riprova al prossimo ciclo
                 else:
                     log(f"Fear&Greed: {fear_greed}")
                     log("AI in analisi...")
@@ -433,7 +431,7 @@ def main():
                     if action == "BUY" and balance >= 10 and not positions:
                         success = place_order("BUY", market["price"], balance)
                         if success:
-                            last_analysis = now  # Aspetta 1h prima di prossima analisi
+                            last_analysis = now  # Aspetta 1h
                         # Se fallisce → last_analysis rimane 0 → riprova subito
 
                     elif action == "SELL" and balance >= 10 and not positions:
@@ -442,13 +440,15 @@ def main():
                             last_analysis = now
                         # Se fallisce → riprova subito
 
+                    elif positions:
+                        # Posizione aperta → aspetta 1h prima di rivalutare
+                        log("Posizione già aperta — monitoriamo")
+                        last_analysis = now
+
                     else:
-                        # HOLD → non aggiornare last_analysis → rianalizza al prossimo ciclo
-                        log("HOLD - nessuna operazione")
-                        if positions:
-                            log("Posizione già aperta — monitoriamo")
-                            last_analysis = now  # Con posizione aperta, aspetta 1h
-                        # Senza posizione e HOLD → rianalizza tra 5 min (prossimo monitor)
+                        # HOLD senza posizione → rianalizza al prossimo ciclo (5 min)
+                        log("HOLD — rianalisi tra 5 minuti")
+                        # Non aggiorno last_analysis
 
             log(f"Prossimo ciclo tra {MONITOR//60} minuti")
             time.sleep(MONITOR)
