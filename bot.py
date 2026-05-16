@@ -24,7 +24,7 @@ MAX_RISK  = 0.05
 SL_PCT    = 0.015
 TP_PCT    = 0.03
 TRAIL_PCT = 0.0266
-INTERVAL  = 3600
+INTERVAL  = 1800   # FIX: era 3600 (1h), ora 1800 (30min) per reagire più velocemente
 MONITOR   = 300
 MAX_HISTORY = 20
 
@@ -39,8 +39,9 @@ exchange_close = Exchange(account, constants.MAINNET_API_URL, account_address=HY
 
 # ─── STATE ────────────────────────────────────────────────────────────────────
 decision_history = deque(maxlen=MAX_HISTORY)
-subscriber_ids   = set()   # all chat IDs that have /start-ed the bot
-last_update_id   = 0       # for Telegram long polling
+subscriber_ids   = set()
+last_update_id   = 0
+trailing_stops   = {}  # FIX: dizionario per tracciare trailing stop reali per coin
 
 # ─── LOG ─────────────────────────────────────────────────────────────────────
 def log(msg):
@@ -49,7 +50,6 @@ def log(msg):
 
 # ─── TELEGRAM: POLL FOR NEW USERS ─────────────────────────────────────────────
 def poll_telegram():
-    """Check for new /start messages and register users."""
     global last_update_id
     try:
         r = requests.get(
@@ -67,7 +67,6 @@ def poll_telegram():
                 if chat_id not in subscriber_ids:
                     subscriber_ids.add(chat_id)
                     log(f"New subscriber: {chat_id} (total: {len(subscriber_ids)})")
-                    # Welcome message
                     send_message(
                         f"👋 Welcome to *AI Trading Bot*!\n\n"
                         f"You will now receive all trading updates, decisions and alerts.\n\n"
@@ -79,11 +78,9 @@ def poll_telegram():
                     )
                 else:
                     send_message("You are already subscribed! ✅", chat_id=chat_id)
-
             elif chat_id and text.startswith("/stop"):
                 subscriber_ids.discard(chat_id)
                 send_message("You have unsubscribed. Send /start to re-subscribe.", chat_id=chat_id)
-
             elif chat_id and text.startswith("/status"):
                 balance   = get_balance()
                 positions = get_positions()
@@ -108,7 +105,6 @@ def poll_telegram():
 
 # ─── TELEGRAM: SEND TO ONE ────────────────────────────────────────────────────
 def send_message(text, chat_id=None, parse_mode="Markdown"):
-    """Send a message to a specific chat_id."""
     try:
         requests.post(
             f"{TELEGRAM_URL}/sendMessage",
@@ -120,7 +116,6 @@ def send_message(text, chat_id=None, parse_mode="Markdown"):
 
 # ─── TELEGRAM: BROADCAST TO ALL ───────────────────────────────────────────────
 def notify(msg, important=False):
-    """Broadcast a message to all subscribers."""
     if not TELEGRAM_TOKEN or not subscriber_ids:
         return
     prefix = "🚨 " if important else "🤖 "
@@ -128,16 +123,17 @@ def notify(msg, important=False):
     for chat_id in list(subscriber_ids):
         send_message(text, chat_id=chat_id)
 
-# ─── BILANCIO SPOT ────────────────────────────────────────────────────────────
+# ─── FIX 1: BILANCIO PERPS (non spot) ────────────────────────────────────────
 def get_balance():
+    """
+    FIX: Legge il saldo dal conto PERPS (clearinghouseState),
+    non dallo spot (spotClearinghouseState).
+    Prima leggeva il saldo sbagliato → il bot poteva non tradare mai.
+    """
     try:
-        r        = requests.post(f"{HL_URL}/info",
-                                 json={"type": "spotClearinghouseState", "user": HYPERLIQUID_ADDR},
-                                 timeout=15)
-        balances = r.json().get("balances", [])
-        usdc     = next((b for b in balances if b["coin"] == "USDC"), None)
-        balance  = float(usdc["total"]) if usdc else 0.0
-        log(f"Bilancio USDC: ${balance:.2f}")
+        state = hl_info.user_state(HYPERLIQUID_ADDR)
+        balance = float(state.get("crossMarginSummary", {}).get("accountValue", 0))
+        log(f"Bilancio USDC (perps): ${balance:.2f}")
         return balance
     except Exception as e:
         log(f"[ERRORE] Bilancio: {e}")
@@ -172,29 +168,65 @@ def get_price():
     except:
         return 0.0
 
-# ─── APRI ORDINE ─────────────────────────────────────────────────────────────
+# ─── FIX 2: LIMIT ORDER (maker) invece di market (taker) ─────────────────────
 def place_order(side, price, balance):
+    """
+    FIX: Usa limit order invece di market order.
+    Risparmio fee: 0,0144% (maker) vs 0,0432% (taker) → 3x meno costoso.
+    Dopo l'apertura piazza SL e TP come ordini reali su Hyperliquid.
+    """
     try:
         size     = round((balance * min(RISK_PCT, MAX_RISK) * LEVERAGE) / price, 5)
         min_size = round(10 / price * 1.01, 5)
         size     = max(size, min_size)
         is_buy   = side == "BUY"
-        sl       = round(price * (1 - SL_PCT) if is_buy else price * (1 + SL_PCT), 2)
-        tp       = round(price * (1 + TP_PCT)  if is_buy else price * (1 - TP_PCT), 2)
 
-        log(f"Apertura {side}: {size} BTC @ ${price:,.2f}")
-        result = exchange_open.market_open(SYMBOL, is_buy, size)
+        # FIX: Prezzo limit leggermente migliore del market per entrare come maker
+        # BUY: offriamo un po' sotto il prezzo attuale
+        # SELL: offriamo un po' sopra il prezzo attuale
+        if is_buy:
+            limit_price = round(price * 0.9998, 1)  # 0.02% sotto
+        else:
+            limit_price = round(price * 1.0002, 1)  # 0.02% sopra
+
+        sl = round(price * (1 - SL_PCT) if is_buy else price * (1 + SL_PCT), 1)
+        tp = round(price * (1 + TP_PCT) if is_buy else price * (1 - TP_PCT), 1)
+
+        log(f"Apertura {side} LIMIT: {size} BTC @ ${limit_price:,.2f} (market: ${price:,.2f})")
+
+        # FIX: Limit order con GTC (Good Till Cancelled)
+        result = exchange_open.order(
+            SYMBOL,
+            is_buy,
+            size,
+            limit_price,
+            {"limit": {"tif": "Gtc"}}
+        )
 
         if result and result.get("status") == "ok":
             statuses = result.get("response", {}).get("data", {}).get("statuses", [])
             if statuses and "error" not in statuses[0]:
-                log(f"Ordine {side} eseguito! SL: ${sl:,.2f} | TP: ${tp:,.2f}")
+                log(f"Ordine {side} LIMIT inviato @ ${limit_price:,.2f}")
+
+                # FIX 3: Piazza SL e TP come ordini reali su Hyperliquid
+                # Aspetta 2 secondi che l'ordine venga processato
+                time.sleep(2)
+                place_sl_tp(side, size, sl, tp, is_buy)
+
+                # Inizializza trailing stop tracking
+                trailing_stops[SYMBOL] = {
+                    "side": side,
+                    "sl": sl,
+                    "entry": price
+                }
+
                 notify(
-                    f"{'🟢' if is_buy else '🔴'} *Order {side} opened!*\n"
-                    f"BTC @ ${price:,.2f}\n"
+                    f"{'🟢' if is_buy else '🔴'} *Ordine {side} LIMIT aperto!*\n"
+                    f"BTC @ ${limit_price:,.2f}\n"
                     f"Size: {size} BTC\n"
-                    f"Stop Loss: ${sl:,.2f}\n"
-                    f"Take Profit: ${tp:,.2f}",
+                    f"Stop Loss reale: ${sl:,.2f}\n"
+                    f"Take Profit reale: ${tp:,.2f}\n"
+                    f"Fee risparmiate: ~{(0.0432-0.0144):.4f}% (maker vs taker)",
                     important=True
                 )
                 return True
@@ -208,15 +240,83 @@ def place_order(side, price, balance):
         log(f"[ERRORE] Ordine: {e}")
         return False
 
+# ─── FIX 3: SL E TP COME ORDINI REALI ────────────────────────────────────────
+def place_sl_tp(side, size, sl_price, tp_price, is_buy):
+    """
+    FIX CRITICO: Piazza Stop Loss e Take Profit come ordini reali su Hyperliquid.
+    Prima erano solo simulati nel codice Python → se il bot crashava, nessuna protezione.
+    Ora gli ordini vivono sul server Hyperliquid indipendentemente dal bot.
+    """
+    try:
+        # Stop Loss: ordine trigger che si attiva al prezzo SL
+        sl_result = exchange_close.order(
+            SYMBOL,
+            not is_buy,   # direzione opposta per chiudere
+            size,
+            sl_price,
+            {
+                "trigger": {
+                    "triggerPx": sl_price,
+                    "isMarket": True,       # esegui a mercato quando triggerato
+                    "tpsl": "sl"            # tipo: stop loss
+                }
+            },
+            reduce_only=True
+        )
+        if sl_result and sl_result.get("status") == "ok":
+            log(f"✅ Stop Loss reale piazzato @ ${sl_price:,.2f}")
+        else:
+            log(f"⚠️ Errore SL: {sl_result}")
+
+        # Take Profit: ordine trigger al prezzo TP
+        tp_result = exchange_close.order(
+            SYMBOL,
+            not is_buy,
+            size,
+            tp_price,
+            {
+                "trigger": {
+                    "triggerPx": tp_price,
+                    "isMarket": True,
+                    "tpsl": "tp"            # tipo: take profit
+                }
+            },
+            reduce_only=True
+        )
+        if tp_result and tp_result.get("status") == "ok":
+            log(f"✅ Take Profit reale piazzato @ ${tp_price:,.2f}")
+        else:
+            log(f"⚠️ Errore TP: {tp_result}")
+
+    except Exception as e:
+        log(f"[ERRORE] SL/TP: {e}")
+
+# ─── CANCELLA ORDINI APERTI ───────────────────────────────────────────────────
+def cancel_open_orders():
+    """Cancella tutti gli ordini aperti (SL/TP) quando si chiude manualmente una posizione."""
+    try:
+        open_orders = hl_info.open_orders(HYPERLIQUID_ADDR)
+        for order in open_orders:
+            if order.get("coin") == SYMBOL:
+                exchange_close.cancel(SYMBOL, order["oid"])
+                log(f"Ordine {order['oid']} cancellato")
+    except Exception as e:
+        log(f"[ERRORE] Cancellazione ordini: {e}")
+
 # ─── CHIUDI POSIZIONE ─────────────────────────────────────────────────────────
 def close_position(pos):
     try:
         coin   = pos["coin"]
         size   = abs(pos["size"])
         log(f"Chiusura {pos['side']} {coin} size={size}")
+
+        # Prima cancella SL/TP reali per evitare doppia esecuzione
+        cancel_open_orders()
+
         result = exchange_close.market_close(coin, sz=size)
         if result and result.get("status") == "ok":
             log(f"Posizione {coin} chiusa!")
+            trailing_stops.pop(SYMBOL, None)
             return True
         else:
             log(f"Errore chiusura: {result}")
@@ -225,12 +325,93 @@ def close_position(pos):
         log(f"[ERRORE] Chiusura: {e}")
         return False
 
+# ─── FIX 4: TRAILING STOP FUNZIONANTE ────────────────────────────────────────
+def update_trailing_stop(pos, price):
+    """
+    FIX: Il trailing stop ora aggiorna realmente l'ordine SL su Hyperliquid.
+    Prima calcolava il nuovo prezzo ma non faceva nulla (solo un log).
+    Ora cancella il vecchio SL e ne piazza uno nuovo al prezzo aggiornato.
+    """
+    coin    = pos["coin"]
+    is_long = pos["side"] == "LONG"
+    size    = abs(pos["size"])
+    entry   = pos["entry"]
+
+    trail_data = trailing_stops.get(SYMBOL, {})
+    current_sl = trail_data.get("sl", entry * (1 - SL_PCT) if is_long else entry * (1 + SL_PCT))
+
+    if is_long and price >= entry * 1.02:
+        new_sl = round(price * (1 - TRAIL_PCT), 1)
+        if new_sl > current_sl:
+            log(f"Trailing stop LONG aggiornato: ${current_sl:,.2f} → ${new_sl:,.2f}")
+
+            # Cancella vecchio SL
+            cancel_open_orders()
+
+            # Piazza nuovo SL aggiornato
+            try:
+                sl_result = exchange_close.order(
+                    SYMBOL,
+                    False,      # sell per chiudere long
+                    size,
+                    new_sl,
+                    {
+                        "trigger": {
+                            "triggerPx": new_sl,
+                            "isMarket": True,
+                            "tpsl": "sl"
+                        }
+                    },
+                    reduce_only=True
+                )
+                if sl_result and sl_result.get("status") == "ok":
+                    trailing_stops[SYMBOL]["sl"] = new_sl
+                    log(f"✅ Nuovo trailing SL piazzato @ ${new_sl:,.2f}")
+                    notify(f"📈 *Trailing Stop aggiornato*\n${current_sl:,.2f} → ${new_sl:,.2f}\nProfitto protetto: ${(new_sl - entry) * size:.2f} USDC")
+            except Exception as e:
+                log(f"[ERRORE] Aggiornamento trailing SL: {e}")
+
+    elif not is_long and price <= entry * 0.98:
+        new_sl = round(price * (1 + TRAIL_PCT), 1)
+        if new_sl < current_sl:
+            log(f"Trailing stop SHORT aggiornato: ${current_sl:,.2f} → ${new_sl:,.2f}")
+
+            cancel_open_orders()
+
+            try:
+                sl_result = exchange_close.order(
+                    SYMBOL,
+                    True,       # buy per chiudere short
+                    size,
+                    new_sl,
+                    {
+                        "trigger": {
+                            "triggerPx": new_sl,
+                            "isMarket": True,
+                            "tpsl": "sl"
+                        }
+                    },
+                    reduce_only=True
+                )
+                if sl_result and sl_result.get("status") == "ok":
+                    trailing_stops[SYMBOL]["sl"] = new_sl
+                    log(f"✅ Nuovo trailing SL SHORT piazzato @ ${new_sl:,.2f}")
+                    notify(f"📉 *Trailing Stop SHORT aggiornato*\n${current_sl:,.2f} → ${new_sl:,.2f}")
+            except Exception as e:
+                log(f"[ERRORE] Aggiornamento trailing SL SHORT: {e}")
+
 # ─── MONITORAGGIO POSIZIONI ───────────────────────────────────────────────────
 def monitor_positions():
+    """
+    FIX: Il monitoraggio ora serve principalmente per il trailing stop.
+    SL e TP reali vengono gestiti direttamente da Hyperliquid,
+    quindi non c'è più rischio se il bot crasha.
+    """
     positions       = get_positions()
     position_closed = False
 
     if not positions:
+        trailing_stops.clear()
         return False
 
     price = get_price()
@@ -239,53 +420,28 @@ def monitor_positions():
         entry   = pos["entry"]
         pnl     = pos["pnl"]
         is_long = pos["side"] == "LONG"
-        sl      = entry * (1 - SL_PCT) if is_long else entry * (1 + SL_PCT)
-        tp      = entry * (1 + TP_PCT) if is_long else entry * (1 - TP_PCT)
 
         log(f"Pos {pos['side']} | Entry: ${entry:,.2f} | PnL: ${pnl:.2f} | Price: ${price:,.2f}")
 
-        if (is_long and price <= sl) or (not is_long and price >= sl):
-            log("STOP LOSS scattato!")
-            if close_position(pos):
-                position_closed = True
-                if decision_history:
-                    decision_history[-1]["outcome"] = f"STOP LOSS @ ${price:,.2f} | PnL: ${pnl:.2f}"
-                notify(
-                    f"🔴 *STOP LOSS hit!*\n"
-                    f"{pos['side']} BTC\n"
-                    f"Entry: ${entry:,.2f} → ${price:,.2f}\n"
-                    f"PnL: ${pnl:.2f} USDC",
-                    important=True
-                )
-
-        elif (is_long and price >= tp) or (not is_long and price <= tp):
-            log("TAKE PROFIT raggiunto!")
-            if close_position(pos):
-                position_closed = True
-                if decision_history:
-                    decision_history[-1]["outcome"] = f"TAKE PROFIT @ ${price:,.2f} | PnL: ${pnl:.2f}"
-                notify(
-                    f"✅ *TAKE PROFIT hit!*\n"
-                    f"{pos['side']} BTC\n"
-                    f"Entry: ${entry:,.2f} → ${price:,.2f}\n"
-                    f"PnL: ${pnl:.2f} USDC",
-                    important=True
-                )
-
-        elif is_long and price >= entry * 1.02:
-            new_sl = price * (1 - TRAIL_PCT)
-            if new_sl > sl:
-                log(f"Trailing stop → ${new_sl:,.2f}")
-                notify(f"📈 Trailing stop updated: ${new_sl:,.2f}")
-        elif not is_long and price <= entry * 0.98:
-            new_sl = price * (1 + TRAIL_PCT)
-            if new_sl < sl:
-                log(f"Trailing stop → ${new_sl:,.2f}")
-                notify(f"📉 Trailing stop updated: ${new_sl:,.2f}")
-        else:
-            log("Position running — no action needed")
+        # FIX: aggiorna trailing stop reale (SL/TP base gestiti da Hyperliquid)
+        update_trailing_stop(pos, price)
 
     return position_closed
+
+# ─── FIX 5: EMA CORRETTA (esponenziale, non semplice) ────────────────────────
+def calculate_ema(closes, period):
+    """
+    FIX: EMA vera con smoothing esponenziale.
+    Prima usava sum(closes[-N:])/N che è una SMA, non una EMA.
+    L'EMA pesa di più i dati recenti → segnali più reattivi.
+    """
+    if len(closes) < period:
+        return sum(closes) / len(closes)
+    k = 2 / (period + 1)
+    ema = sum(closes[:period]) / period  # seed con SMA
+    for price in closes[period:]:
+        ema = price * k + ema * (1 - k)
+    return round(ema, 2)
 
 # ─── DATI MERCATO ─────────────────────────────────────────────────────────────
 def get_market_data():
@@ -312,11 +468,13 @@ def get_market_data():
         avg_g  = sum(gains[-14:]) / 14
         avg_l  = sum(losses[-14:]) / 14
         rsi    = round(100 - (100 / (1 + avg_g / avg_l)), 2) if avg_l != 0 else 50
-        ema12  = sum(closes[-12:]) / 12
-        ema26  = sum(closes[-26:]) / 26
+
+        # FIX: EMA vera invece di SMA
+        ema12  = calculate_ema(closes, 12)
+        ema26  = calculate_ema(closes, 26)
+        ema20  = calculate_ema(closes, 20)
+        ema200 = calculate_ema(closes, 200) if len(closes) >= 200 else calculate_ema(closes, len(closes))
         macd   = round(ema12 - ema26, 2)
-        ema20  = round(sum(closes[-20:]) / 20, 2)
-        ema200 = round(sum(closes[-200:]) / 200, 2) if len(closes) >= 200 else round(sum(closes) / len(closes), 2)
 
         bb_closes = closes[-20:]
         bb_mean   = sum(bb_closes) / 20
@@ -330,7 +488,7 @@ def get_market_data():
         pivot = round((last_high + last_low + last_close) / 3, 2)
         r1    = round(2 * pivot - last_low, 2)
         s1    = round(2 * pivot - last_high, 2)
-        r2    = round(pivot + (last_high - last_low), 2)
+        r2_   = round(pivot + (last_high - last_low), 2)
         s2    = round(pivot - (last_high - last_low), 2)
 
         trs = [max(highs[-i]-lows[-i], abs(highs[-i]-closes[-i-1]), abs(lows[-i]-closes[-i-1]))
@@ -362,7 +520,7 @@ def get_market_data():
             "rsi": rsi, "macd": macd,
             "ema20": ema20, "ema200": ema200,
             "bb_upper": bb_upper, "bb_lower": bb_lower,
-            "pivot": pivot, "r1": r1, "s1": s1, "r2": r2, "s2": s2,
+            "pivot": pivot, "r1": r1, "s1": s1, "r2": r2_, "s2": s2,
             "atr": atr, "order_book": order_book, "forecast": forecast,
             "high": max(closes[-24:]), "low": min(closes[-24:]),
             "volume": round(sum(volumes[-5:]) / 5, 2)
@@ -478,7 +636,6 @@ CRITICAL RULES:
             f'{{"action":"HOLD","reason":"..."}}'
         )
 
-        # Build multi-turn messages from history
         messages = []
         for h in list(decision_history)[:-1]:
             messages.append({
@@ -518,25 +675,23 @@ CRITICAL RULES:
 
 # ─── MAIN LOOP ───────────────────────────────────────────────────────────────
 def main():
-    log("AI Trading Bot su Hyperliquid avviato!")
+    log("AI Trading Bot su Hyperliquid avviato! [versione FIX]")
     log(f"API address:  {account.address}")
     log(f"Main address: {HYPERLIQUID_ADDR}")
     log(f"Analisi ogni {INTERVAL//60} min | Monitoraggio ogni {MONITOR//60} min")
+    log("FIX attivi: bilancio perps, limit orders, SL/TP reali, trailing stop reale, EMA vera")
     log("Telegram bot listening for /start commands...")
 
     last_analysis = 0
 
-    # Initial poll to pick up any existing subscribers
     poll_telegram()
 
     while True:
         try:
             now = time.time()
 
-            # ── POLL TELEGRAM FOR NEW USERS ──
             poll_telegram()
 
-            # ── MONITORAGGIO POSIZIONI ──
             log("--- Position monitoring ---")
             position_closed = monitor_positions()
 
@@ -544,7 +699,6 @@ def main():
                 log("Position closed! Immediate analysis...")
                 last_analysis = 0
 
-            # ── ANALISI COMPLETA ──
             if now - last_analysis >= INTERVAL:
                 log("=" * 60)
                 log("FULL ANALYSIS")
@@ -570,7 +724,6 @@ def main():
                     log(f"Decision: {action}")
                     log(f"Reason: {reason}")
 
-                    # ── REGISTER IN HISTORY ──
                     decision_history.append({
                         "ts":         datetime.now().strftime("%Y-%m-%d %H:%M"),
                         "price":      market["price"],
@@ -583,7 +736,6 @@ def main():
                         "outcome":    None
                     })
 
-                    # ── BROADCAST ANALYSIS TO ALL SUBSCRIBERS ──
                     action_emoji = "🟢" if action == "BUY" else "🔴" if action == "SELL" else "⏸️"
                     notify(
                         f"{action_emoji} *Decision: {action}*\n\n"
@@ -597,13 +749,13 @@ def main():
                     if action == "BUY" and balance >= 10 and not positions:
                         success = place_order("BUY", market["price"], balance)
                         if success:
-                            decision_history[-1]["outcome"] = f"Order opened @ ${market['price']:,.2f}"
+                            decision_history[-1]["outcome"] = f"Limit order BUY @ ${market['price']:,.2f}"
                             last_analysis = now
 
                     elif action == "SELL" and balance >= 10 and not positions:
                         success = place_order("SELL", market["price"], balance)
                         if success:
-                            decision_history[-1]["outcome"] = f"Order opened @ ${market['price']:,.2f}"
+                            decision_history[-1]["outcome"] = f"Limit order SELL @ ${market['price']:,.2f}"
                             last_analysis = now
 
                     elif positions:
@@ -613,7 +765,7 @@ def main():
 
                     else:
                         decision_history[-1]["outcome"] = "HOLD — no action"
-                        log("HOLD — re-analysis in 5 minutes")
+                        log("HOLD — re-analysis in 30 minutes")
 
             log(f"Next cycle in {MONITOR//60} minutes")
             time.sleep(MONITOR)
