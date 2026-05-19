@@ -123,20 +123,19 @@ def notify(msg, important=False):
     for chat_id in list(subscriber_ids):
         send_message(text, chat_id=chat_id)
 
-# ─── FIX 1: BILANCIO PERPS (non spot) ────────────────────────────────────────
+import requests
 def get_balance():
-    """
-    FIX: Legge il saldo dal conto PERPS (clearinghouseState),
-    non dallo spot (spotClearinghouseState).
-    Prima leggeva il saldo sbagliato → il bot poteva non tradare mai.
-    """
     try:
-        state = hl_info.user_state(HYPERLIQUID_ADDR)
-        balance = float(state.get("crossMarginSummary", {}).get("accountValue", 0))
-        log(f"Bilancio USDC (perps): ${balance:.2f}")
+        r        = requests.post(f"{HL_URL}/info",
+                                 json={"type": "spotClearinghouseState", "user": HYPERLIQUID_ADDR},
+                                 timeout=15)
+        balances = r.json().get("balances", [])
+        usdc     = next((b for b in balances if b["coin"] == "USDC"), None)
+        balance  = float(usdc["total"]) if usdc else 0.0
+        print(f"Bilancio USDC: ${balance:.2f}")
         return balance
     except Exception as e:
-        log(f"[ERRORE] Bilancio: {e}")
+        print(f"[ERRORE] Bilancio: {e}")
         return 0.0
 
 # ─── POSIZIONI APERTE ─────────────────────────────────────────────────────────
