@@ -636,7 +636,7 @@ CRITICAL RULES:
         )
 
         messages = []
-        for h in list(decision_history)[:-1]:
+        for h in list(decision_history)[-6:-1]:
             messages.append({
                 "role": "user",
                 "content": (
