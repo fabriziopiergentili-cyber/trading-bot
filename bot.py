@@ -667,6 +667,7 @@ CRITICAL RULES:
         text  = resp["content"][0]["text"].strip()
         start = text.find("{")
         end   = text.rfind("}") + 1
+        log(f'AI response: {text}')
         return json.loads(text[start:end])
     except Exception as e:
         log(f"[ERRORE] AI: {e}")
