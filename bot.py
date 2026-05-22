@@ -747,26 +747,33 @@ def main():
                     )
 
                     if action == "BUY" and balance >= 10 and not positions:
-                        success = place_order("BUY", market["price"], balance)
-                        if success:
-                            decision_history[-1]["outcome"] = f"Limit order BUY @ ${market['price']:,.2f}"
-                            last_analysis = now
+    success = place_order("BUY", market["price"], balance)
+    if success:
+        decision_history[-1]["outcome"] = f"Limit order BUY @ ${market['price']:,.2f}"
+        last_analysis = now
 
-                    elif action == "SELL" and balance >= 10 and not positions:
-                        success = place_order("SELL", market["price"], balance)
-                        if success:
-                            decision_history[-1]["outcome"] = f"Limit order SELL @ ${market['price']:,.2f}"
-                            last_analysis = now
+elif action == "SELL" and balance >= 10 and not positions:
+    success = place_order("SELL", market["price"], balance)
+    if success:
+        decision_history[-1]["outcome"] = f"Limit order SELL @ ${market['price']:,.2f}"
+        last_analysis = now
 
-                    elif positions:
-                        pos = positions[0]
-                        decision_history[-1]["outcome"] = f"Position already open, PnL=${pos['pnl']:.2f}"
-                        last_analysis = now
+elif action == "CLOSE" and positions:
+    log("AI ha deciso di chiudere la posizione!")
+    success = close_position(positions[0])
+    if success:
+        decision_history[-1]["outcome"] = f"CLOSED @ ${market['price']:,.2f}"
+        notify("🔒 *Posizione chiusa su decisione AI*\n" + reason, important=True)
+        last_analysis = 0
 
-                    else:
-                        decision_history[-1]["outcome"] = "HOLD — no action"
-                        log("HOLD — re-analysis in 30 minutes")
+elif positions:
+    pos = positions[0]
+    decision_history[-1]["outcome"] = f"Position already open, PnL=${pos['pnl']:.2f}"
+    last_analysis = now
 
+else:
+    decision_history[-1]["outcome"] = "HOLD — no action"
+    log("HOLD — re-analysis in 30 minutes")
             log(f"Next cycle in {MONITOR//60} minutes")
             time.sleep(MONITOR)
 
