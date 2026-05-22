@@ -745,7 +745,8 @@ def main():
                         f"_{reason}_",
                         important=(action != "HOLD")
                     )
-if action == "BUY" and balance >= 10 and not positions:
+                    
+                    if action == "BUY" and balance >= 10 and not positions:
                         success = place_order("BUY", market["price"], balance)
                         if success:
                             decision_history[-1]["outcome"] = f"Limit order BUY @ ${market['price']:,.2f}"
