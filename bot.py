@@ -278,6 +278,7 @@ def place_order(side, price, balance):
         # FIX 1: prezzo leggermente SOPRA mercato per BUY e SOTTO per SELL
         # → si esegue subito come taker ma con slippage minimo
         limit_price = round(price * 1.001, 1) if is_buy else round(price * 0.999, 1)
+        limit_price = round(round(limit_price / 0.1) * 0.1, 1)  # tick size fix
         sl = round(price * (1 - SL_PCT) if is_buy else price * (1 + SL_PCT), 1)
         tp = round(price * (1 + TP_PCT)  if is_buy else price * (1 - TP_PCT),  1)
  
