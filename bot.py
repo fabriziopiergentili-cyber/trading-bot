@@ -3,6 +3,7 @@ import time
 import json
 import requests
 import math
+import re
 from datetime import datetime
 from collections import deque
 from eth_account import Account
@@ -94,7 +95,6 @@ def record_trade(side, entry, exit_price, pnl, reason="", duration_min=None):
         "reason":   reason,
         "duration": duration_min
     })
-    # Troncamento in-place per evitare il bug della variabile locale
     if len(trade_history) > MAX_TRADES_STORED:
         trade_history[:] = trade_history[-MAX_TRADES_STORED:]
     dur_str = f" | Durata: {duration_min} min" if duration_min is not None else ""
@@ -245,16 +245,17 @@ def notify(msg, important=False):
     for chat_id in list(subscriber_ids):
         send_message(text, chat_id=chat_id)
 
-# ─── BILANCIO (corretto: clearinghouseState) ─────────────────────────────────
+# ─── BILANCIO (SPOT) ─────────────────────────────────────────────────────────
 def get_balance():
     try:
         r = requests.post(f"{HL_URL}/info",
-                          json={"type": "clearinghouseState", "user": HYPERLIQUID_ADDR},
+                          json={"type": "spotClearinghouseState", "user": HYPERLIQUID_ADDR},
                           timeout=15)
-        data = r.json()
-        account_value = float(data.get("marginSummary", {}).get("accountValue", 0))
-        log(f"Saldo conto: ${account_value:.2f}")
-        return account_value
+        balances = r.json().get("balances", [])
+        usdc = next((b for b in balances if b["coin"] == "USDC"), None)
+        balance = float(usdc["total"]) if usdc else 0.0
+        log(f"Saldo conto (spot): ${balance:.2f}")
+        return balance
     except Exception as e:
         log(f"[ERRORE] Bilancio: {e}")
         return 0.0
@@ -704,11 +705,29 @@ GENERAL:
         if "content" not in resp:
             log(f"API error: {resp.get('error', resp)}")
             return {"action": "HOLD", "reason": "API error"}
-        text  = resp["content"][0]["text"].strip()
-        start = text.find("{")
-        end   = text.rfind("}") + 1
-        log(f"AI response: {text}")
-        return json.loads(text[start:end])
+        text = resp["content"][0]["text"].strip()
+        log(f"AI raw response: {text}")
+
+        # Estrazione robusta JSON usando regex
+        json_match = re.search(r'```json\s*(\{.*?\})\s*```', text, re.DOTALL)
+        if not json_match:
+            json_match = re.search(r'(\{.*?\})', text, re.DOTALL)
+        if json_match:
+            json_str = json_match.group(1)
+        else:
+            json_str = text
+
+        try:
+            decision = json.loads(json_str)
+        except json.JSONDecodeError as e:
+            log(f"JSON decode error: {e} - string: {json_str[:200]}")
+            return {"action": "HOLD", "reason": "JSON parse error"}
+
+        if decision.get("action") not in ["BUY", "SELL", "CLOSE", "HOLD"]:
+            log(f"Invalid action: {decision.get('action')}")
+            return {"action": "HOLD", "reason": "Invalid action from AI"}
+
+        return decision
     except Exception as e:
         log(f"[ERRORE] AI: {e}")
         return {"action": "HOLD", "reason": "AI error"}
