@@ -24,14 +24,15 @@ MAX_RISK  = 0.05
 SL_PCT    = 0.012
 TP_PCT    = 0.04
 TRAIL_PCT = 0.0266
-TRAILING_ENABLED = False   # disabilitato nei primi 20-30 trade
+TRAILING_ENABLED = False
 INTERVAL  = 1800
 MONITOR   = 300
 MAX_HISTORY  = 20
+MAX_TRADES_STORED = 500
 HISTORY_FILE = "/app/history.json"
 
 HL_URL       = "https://api.hyperliquid.xyz"
-TELEGRAM_URL = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
+TELEGRAM_URL = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}" if TELEGRAM_TOKEN else None
 
 # ─── SETUP SDK ────────────────────────────────────────────────────────────────
 account        = Account.from_key(HYPERLIQUID_KEY)
@@ -45,8 +46,8 @@ subscriber_ids    = set()
 last_update_id    = 0
 trailing_stops    = {}
 trade_history     = []
-position_open_time = None   # timestamp apertura posizione corrente
-last_known_position = None  # ultima posizione vista (per rilevare SL/TP scattati su HL)
+position_open_time = None
+last_known_position = None
 last_daily_report = None
 DAILY_REPORT_HOUR = 8
 
@@ -59,7 +60,7 @@ def log(msg):
 def save_history():
     try:
         data = {
-            "trade_history":    trade_history,
+            "trade_history":    trade_history[-MAX_TRADES_STORED:],
             "decision_history": list(decision_history)
         }
         with open(HISTORY_FILE, "w") as f:
@@ -72,7 +73,7 @@ def load_history():
     try:
         with open(HISTORY_FILE, "r") as f:
             data = json.load(f)
-        trade_history = data.get("trade_history", [])
+        trade_history = data.get("trade_history", [])[-MAX_TRADES_STORED:]
         for h in data.get("decision_history", []):
             decision_history.append(h)
         log(f"History caricata: {len(trade_history)} trade, {len(decision_history)} decisioni")
@@ -83,6 +84,7 @@ def load_history():
 
 # ─── STATS ───────────────────────────────────────────────────────────────────
 def record_trade(side, entry, exit_price, pnl, reason="", duration_min=None):
+    global trade_history
     trade_history.append({
         "ts":       datetime.now().strftime("%Y-%m-%d %H:%M"),
         "side":     side,
@@ -90,8 +92,11 @@ def record_trade(side, entry, exit_price, pnl, reason="", duration_min=None):
         "exit":     exit_price,
         "pnl":      round(pnl, 4),
         "reason":   reason,
-        "duration": duration_min   # durata in minuti, None se sconosciuta
+        "duration": duration_min
     })
+    # Troncamento in-place per evitare il bug della variabile locale
+    if len(trade_history) > MAX_TRADES_STORED:
+        trade_history[:] = trade_history[-MAX_TRADES_STORED:]
     dur_str = f" | Durata: {duration_min} min" if duration_min is not None else ""
     log(f"Trade registrato: {side} | Entry: ${entry:,.2f} | Exit: ${exit_price:,.2f} | PnL: ${pnl:.4f} | {reason}{dur_str}")
     save_history()
@@ -107,10 +112,8 @@ def get_stats():
     total_pnl = round(sum(t["pnl"] for t in trade_history), 4)
     best      = max(trade_history, key=lambda t: t["pnl"])
     worst     = min(trade_history, key=lambda t: t["pnl"])
-    # Durata media (solo trade con durata registrata)
     durations = [t["duration"] for t in trade_history if t.get("duration") is not None]
     avg_dur   = round(sum(durations) / len(durations)) if durations else None
-    # Uscite premature: chiuse in perdita in meno di 90 min
     premature = [t for t in trade_history
                  if t.get("duration") is not None and t["duration"] < 90 and t["pnl"] < 0]
     return {
@@ -165,6 +168,8 @@ def format_stats_message(balance):
 # ─── TELEGRAM ────────────────────────────────────────────────────────────────
 def poll_telegram():
     global last_update_id
+    if not TELEGRAM_TOKEN:
+        return
     try:
         r = requests.get(
             f"{TELEGRAM_URL}/getUpdates",
@@ -221,6 +226,8 @@ def poll_telegram():
         log(f"[ERRORE] Telegram poll: {e}")
 
 def send_message(text, chat_id=None, parse_mode="Markdown"):
+    if not TELEGRAM_TOKEN or not chat_id:
+        return
     try:
         requests.post(
             f"{TELEGRAM_URL}/sendMessage",
@@ -238,17 +245,16 @@ def notify(msg, important=False):
     for chat_id in list(subscriber_ids):
         send_message(text, chat_id=chat_id)
 
-# ─── BILANCIO ─────────────────────────────────────────────────────────────────
+# ─── BILANCIO (corretto: clearinghouseState) ─────────────────────────────────
 def get_balance():
     try:
-        r        = requests.post(f"{HL_URL}/info",
-                                 json={"type": "spotClearinghouseState", "user": HYPERLIQUID_ADDR},
-                                 timeout=15)
-        balances = r.json().get("balances", [])
-        usdc     = next((b for b in balances if b["coin"] == "USDC"), None)
-        balance  = float(usdc["total"]) if usdc else 0.0
-        log(f"Bilancio USDC: ${balance:.2f}")
-        return balance
+        r = requests.post(f"{HL_URL}/info",
+                          json={"type": "clearinghouseState", "user": HYPERLIQUID_ADDR},
+                          timeout=15)
+        data = r.json()
+        account_value = float(data.get("marginSummary", {}).get("accountValue", 0))
+        log(f"Saldo conto: ${account_value:.2f}")
+        return account_value
     except Exception as e:
         log(f"[ERRORE] Bilancio: {e}")
         return 0.0
@@ -283,8 +289,26 @@ def get_price():
 
 # ─── TICK SIZE HELPER ─────────────────────────────────────────────────────────
 def round_to_tick(price, tick=0.5):
-    """Arrotonda il prezzo al tick size di Hyperliquid (0.5 per BTC)."""
     return round(round(price / tick) * tick, 1)
+
+# ─── CANCELLAZIONE SELETTIVA SOLO SL ─────────────────────────────────────────
+def cancel_sl_order():
+    """Cancella solo l'ordine stop loss (non il TP) per SYMBOL."""
+    try:
+        orders = hl_info.open_orders(HYPERLIQUID_ADDR)
+        for order in orders:
+            if order.get("coin") == SYMBOL:
+                order_type = order.get("orderType", {})
+                trigger = order_type.get("trigger", {})
+                if trigger.get("tpsl") == "sl":
+                    exchange_close.cancel(SYMBOL, order["oid"])
+                    log(f"Cancellato SL order {order['oid']}")
+    except Exception as e:
+        log(f"[ERRORE] Cancel SL: {e}")
+
+def cancel_open_orders():
+    """Mantieni per compatibilità, ma ora usiamo cancel_sl_order."""
+    cancel_sl_order()
 
 # ─── ORDINE ───────────────────────────────────────────────────────────────────
 def place_order(side, price, balance):
@@ -294,7 +318,6 @@ def place_order(side, price, balance):
         size     = max(size, min_size)
         is_buy   = side == "BUY"
 
-        # Prezzo aggressivo arrotondato al tick size corretto
         raw_price   = price * 1.001 if is_buy else price * 0.999
         limit_price = round_to_tick(raw_price)
         sl          = round_to_tick(price * (1 - SL_PCT) if is_buy else price * (1 + SL_PCT))
@@ -356,16 +379,6 @@ def place_sl_tp(side, size, sl_price, tp_price, is_buy):
     except Exception as e:
         log(f"[ERRORE] SL/TP: {e}")
 
-def cancel_open_orders():
-    try:
-        open_orders = hl_info.open_orders(HYPERLIQUID_ADDR)
-        for order in open_orders:
-            if order.get("coin") == SYMBOL:
-                exchange_close.cancel(SYMBOL, order["oid"])
-                log(f"Ordine {order['oid']} cancellato")
-    except Exception as e:
-        log(f"[ERRORE] Cancel orders: {e}")
-
 def close_position(pos):
     try:
         coin = pos["coin"]
@@ -395,7 +408,7 @@ def update_trailing_stop(pos, price):
         new_sl = round_to_tick(price * (1 - TRAIL_PCT))
         if new_sl > current_sl:
             log(f"Trailing LONG: ${current_sl:,.1f} → ${new_sl:,.1f}")
-            cancel_open_orders()
+            cancel_sl_order()
             try:
                 r = exchange_close.order(
                     SYMBOL, False, size, new_sl,
@@ -412,7 +425,7 @@ def update_trailing_stop(pos, price):
         new_sl = round_to_tick(price * (1 + TRAIL_PCT))
         if new_sl < current_sl:
             log(f"Trailing SHORT: ${current_sl:,.1f} → ${new_sl:,.1f}")
-            cancel_open_orders()
+            cancel_sl_order()
             try:
                 r = exchange_close.order(
                     SYMBOL, True, size, new_sl,
@@ -430,11 +443,9 @@ def monitor_positions():
     positions = get_positions()
 
     if not positions:
-        # Se prima c'era una posizione e ora non c'è più → SL o TP è scattato su HL
         if last_known_position is not None:
             prev  = last_known_position
             price = get_price()
-            # PnL stimato: differenza prezzo × size, con segno corretto
             if prev["side"] == "LONG":
                 est_pnl = (price - prev["entry"]) * abs(prev["size"])
             else:
@@ -452,20 +463,21 @@ def monitor_positions():
             )
             last_known_position = None
             position_open_time  = None
-            cancel_open_orders()  # pulisce eventuali ordini SL/TP residui
+            cancel_open_orders()
             trailing_stops.clear()
-            return True   # posizione chiusa → analisi immediata
+            return True
         trailing_stops.clear()
         return False
 
     price = get_price()
     for pos in positions:
         log(f"Pos {pos['side']} | Entry: ${pos['entry']:,.1f} | PnL: ${pos['pnl']:.4f} | Price: ${price:,.1f}")
-        last_known_position = pos   # memorizza per rilevare chiusure su HL
+        last_known_position = pos
         if TRAILING_ENABLED:
             update_trailing_stop(pos, price)
     return False
 
+# ─── INDICATORI (con controllo dati minimi) ──────────────────────────────────
 def calculate_ema(closes, period):
     if len(closes) < period:
         return sum(closes) / len(closes)
@@ -490,6 +502,7 @@ def get_market_data():
         lows    = [float(c["l"]) for c in candles]
         volumes = [float(c["v"]) for c in candles]
         if len(closes) < 26:
+            log("Dati insufficienti (<26 candele)")
             return {}
         gains  = [max(closes[i]-closes[i-1], 0) for i in range(1, len(closes))]
         losses = [max(closes[i-1]-closes[i], 0) for i in range(1, len(closes))]
@@ -517,10 +530,12 @@ def get_market_data():
         trs = [max(highs[-i]-lows[-i], abs(highs[-i]-closes[-i-1]), abs(lows[-i]-closes[-i-1]))
                for i in range(1, min(15, len(closes)))]
         atr = round(sum(trs) / len(trs), 2) if trs else 0
-        # ATR medio sulle ultime 24 candele (per filtro lateralità)
-        trs24 = [max(highs[-i]-lows[-i], abs(highs[-i]-closes[-i-1]), abs(lows[-i]-closes[-i-1]))
-                 for i in range(1, min(25, len(closes)))]
-        atr_24h_avg = round(sum(trs24) / len(trs24), 2) if trs24 else 0
+        if len(closes) >= 25:
+            trs24 = [max(highs[-i]-lows[-i], abs(highs[-i]-closes[-i-1]), abs(lows[-i]-closes[-i-1]))
+                     for i in range(1, 25)]
+            atr_24h_avg = round(sum(trs24) / len(trs24), 2)
+        else:
+            atr_24h_avg = atr
         try:
             r3      = requests.post(f"{HL_URL}/info", json={"type": "l2Book", "coin": SYMBOL}, timeout=15)
             book    = r3.json()
@@ -537,7 +552,7 @@ def get_market_data():
         momentum    = round(((closes[-1] - closes[-10]) / closes[-10]) * 100, 2)
         forecast    = f"Trend 10h: {trend_short} | Trend 50h: {trend_mid} | Momentum: {momentum}%"
         log(f"BTC: ${price:,.2f} | RSI: {rsi} | MACD: {macd} | EMA20: {ema20}")
-        log(f"Pivot: {pivot} | R1: {r1} | S1: {s1} | ATR: {atr}")
+        log(f"Pivot: {pivot} | R1: {r1} | S1: {s1} | ATR: {atr} | ATR24hAvg: {atr_24h_avg}")
         return {
             "price": price, "change24h": change24h,
             "rsi": rsi, "macd": macd,
@@ -563,6 +578,8 @@ def get_oi_funding():
         return "N/A"
 
 def get_news():
+    if not NEWSAPI_KEY:
+        return "News API key mancante"
     try:
         r        = requests.get("https://newsapi.org/v2/everything",
                                 params={"q": "bitcoin crypto elon musk trump",
@@ -601,7 +618,7 @@ def build_history_string():
         return "No history yet."
     lines = ["HISTORY (last cycles):"]
     for i, h in enumerate(list(decision_history)[-10:]):
-        outcome = h.get("outcome", "pending")
+        outcome = h.get("outcome", "pending") or "pending"
         lines.append(f"[{i+1}] {h['ts']} BTC:${h['price']:,.0f} RSI:{h['rsi']} → {h['action']} | {outcome}")
     recent      = list(decision_history)[-5:]
     hold_streak = sum(1 for h in recent if h["action"] == "HOLD")
