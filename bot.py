@@ -21,9 +21,10 @@ SYMBOL    = "BTC"
 LEVERAGE  = 2
 RISK_PCT  = 0.02
 MAX_RISK  = 0.05
-SL_PCT    = 0.015
-TP_PCT    = 0.03
+SL_PCT    = 0.012
+TP_PCT    = 0.04
 TRAIL_PCT = 0.0266
+TRAILING_ENABLED = False   # disabilitato nei primi 20-30 trade
 INTERVAL  = 1800
 MONITOR   = 300
 MAX_HISTORY  = 20
@@ -44,6 +45,8 @@ subscriber_ids    = set()
 last_update_id    = 0
 trailing_stops    = {}
 trade_history     = []
+position_open_time = None   # timestamp apertura posizione corrente
+last_known_position = None  # ultima posizione vista (per rilevare SL/TP scattati su HL)
 last_daily_report = None
 DAILY_REPORT_HOUR = 8
 
@@ -79,16 +82,18 @@ def load_history():
         log(f"[ERRORE] Load history: {e}")
 
 # ─── STATS ───────────────────────────────────────────────────────────────────
-def record_trade(side, entry, exit_price, pnl, reason=""):
+def record_trade(side, entry, exit_price, pnl, reason="", duration_min=None):
     trade_history.append({
-        "ts":     datetime.now().strftime("%Y-%m-%d %H:%M"),
-        "side":   side,
-        "entry":  entry,
-        "exit":   exit_price,
-        "pnl":    round(pnl, 4),
-        "reason": reason
+        "ts":       datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "side":     side,
+        "entry":    entry,
+        "exit":     exit_price,
+        "pnl":      round(pnl, 4),
+        "reason":   reason,
+        "duration": duration_min   # durata in minuti, None se sconosciuta
     })
-    log(f"Trade registrato: {side} | Entry: ${entry:,.2f} | Exit: ${exit_price:,.2f} | PnL: ${pnl:.4f} | {reason}")
+    dur_str = f" | Durata: {duration_min} min" if duration_min is not None else ""
+    log(f"Trade registrato: {side} | Entry: ${entry:,.2f} | Exit: ${exit_price:,.2f} | PnL: ${pnl:.4f} | {reason}{dur_str}")
     save_history()
 
 def get_stats():
@@ -102,12 +107,19 @@ def get_stats():
     total_pnl = round(sum(t["pnl"] for t in trade_history), 4)
     best      = max(trade_history, key=lambda t: t["pnl"])
     worst     = min(trade_history, key=lambda t: t["pnl"])
+    # Durata media (solo trade con durata registrata)
+    durations = [t["duration"] for t in trade_history if t.get("duration") is not None]
+    avg_dur   = round(sum(durations) / len(durations)) if durations else None
+    # Uscite premature: chiuse in perdita in meno di 90 min
+    premature = [t for t in trade_history
+                 if t.get("duration") is not None and t["duration"] < 90 and t["pnl"] < 0]
     return {
         "total": total, "wins": len(wins),
         "losses": len(losses), "breaks": len(breaks),
         "win_rate": win_rate, "total_pnl": total_pnl,
         "best": best["pnl"], "worst": worst["pnl"],
         "best_ts": best["ts"], "worst_ts": worst["ts"],
+        "avg_dur": avg_dur, "premature": len(premature),
     }
 
 def format_stats_message(balance):
@@ -144,6 +156,10 @@ def format_stats_message(balance):
         f"🏆 Miglior trade: ${stats['best']:+.4f} ({stats['best_ts']})\n"
         f"💀 Peggior trade: ${stats['worst']:+.4f} ({stats['worst_ts']})"
     )
+    if stats.get("avg_dur") is not None:
+        msg += f"\n⏱️ Durata media: {stats['avg_dur']} min"
+        if stats["premature"] > 0:
+            msg += f"\n⚠️ Uscite premature (<90min in perdita): {stats['premature']}"
     return msg
 
 # ─── TELEGRAM ────────────────────────────────────────────────────────────────
@@ -294,6 +310,8 @@ def place_order(side, price, balance):
                 time.sleep(2)
                 place_sl_tp(side, size, sl, tp, is_buy)
                 trailing_stops[SYMBOL] = {"side": side, "sl": sl, "entry": price}
+                global position_open_time
+                position_open_time = time.time()
                 notify(
                     f"{'🟢' if is_buy else '🔴'} *Ordine {side} aperto!*\n"
                     f"BTC @ ${limit_price:,.1f}\n"
@@ -408,14 +426,44 @@ def update_trailing_stop(pos, price):
                 log(f"[ERRORE] Trailing SL SHORT: {e}")
 
 def monitor_positions():
+    global last_known_position, position_open_time
     positions = get_positions()
+
     if not positions:
+        # Se prima c'era una posizione e ora non c'è più → SL o TP è scattato su HL
+        if last_known_position is not None:
+            prev  = last_known_position
+            price = get_price()
+            # PnL stimato: differenza prezzo × size, con segno corretto
+            if prev["side"] == "LONG":
+                est_pnl = (price - prev["entry"]) * abs(prev["size"])
+            else:
+                est_pnl = (prev["entry"] - price) * abs(prev["size"])
+            reason = "TP HIT" if est_pnl >= 0 else "SL HIT"
+            dur    = round((time.time() - position_open_time) / 60) if position_open_time else None
+            record_trade(prev["side"], prev["entry"], price, est_pnl, reason, dur)
+            notify(
+                f"{'✅' if est_pnl >= 0 else '🔴'} *{reason}*\n"
+                f"{prev['side']} BTC\n"
+                f"Entry: ${prev['entry']:,.1f} → ${price:,.1f}\n"
+                f"PnL: ${est_pnl:.4f} USDC"
+                + (f"\nDurata: {dur} min" if dur is not None else ""),
+                important=True
+            )
+            last_known_position = None
+            position_open_time  = None
+            cancel_open_orders()  # pulisce eventuali ordini SL/TP residui
+            trailing_stops.clear()
+            return True   # posizione chiusa → analisi immediata
         trailing_stops.clear()
         return False
+
     price = get_price()
     for pos in positions:
         log(f"Pos {pos['side']} | Entry: ${pos['entry']:,.1f} | PnL: ${pos['pnl']:.4f} | Price: ${price:,.1f}")
-        update_trailing_stop(pos, price)
+        last_known_position = pos   # memorizza per rilevare chiusure su HL
+        if TRAILING_ENABLED:
+            update_trailing_stop(pos, price)
     return False
 
 def calculate_ema(closes, period):
@@ -469,6 +517,10 @@ def get_market_data():
         trs = [max(highs[-i]-lows[-i], abs(highs[-i]-closes[-i-1]), abs(lows[-i]-closes[-i-1]))
                for i in range(1, min(15, len(closes)))]
         atr = round(sum(trs) / len(trs), 2) if trs else 0
+        # ATR medio sulle ultime 24 candele (per filtro lateralità)
+        trs24 = [max(highs[-i]-lows[-i], abs(highs[-i]-closes[-i-1]), abs(lows[-i]-closes[-i-1]))
+                 for i in range(1, min(25, len(closes)))]
+        atr_24h_avg = round(sum(trs24) / len(trs24), 2) if trs24 else 0
         try:
             r3      = requests.post(f"{HL_URL}/info", json={"type": "l2Book", "coin": SYMBOL}, timeout=15)
             book    = r3.json()
@@ -492,7 +544,7 @@ def get_market_data():
             "ema20": ema20, "ema200": ema200,
             "bb_upper": bb_upper, "bb_lower": bb_lower,
             "pivot": pivot, "r1": r1, "s1": s1, "r2": r2_, "s2": s2,
-            "atr": atr, "order_book": order_book, "forecast": forecast,
+            "atr": atr, "atr_24h_avg": atr_24h_avg, "order_book": order_book, "forecast": forecast,
             "high": max(closes[-24:]), "low": min(closes[-24:]),
             "volume": round(sum(volumes[-5:]) / 5, 2)
         }
@@ -566,22 +618,36 @@ def ai_decision(market, news, fear_greed, whale, oi_funding, balance, positions)
                 for p in positions
             ])
 
-        system_prompt = """You are an aggressive but disciplined AI trading agent on Hyperliquid.
+        system_prompt = """You are a disciplined AI trading agent on Hyperliquid. Quality over quantity: fewer, higher-probability trades.
 
-RULES:
-1. RSI < 30 → BUY unless MACD is strongly negative AND both trends are bearish.
-2. RSI > 70 → SELL unless strong bullish momentum confirmed.
-3. After 3+ HOLDs with no position: you MUST trade or give a very specific reason why not.
-4. Failed order attempts in history = market rejected entry → try SELL instead or wait for RSI>35.
-5. Keep reason under 60 words.
-6. Respond ONLY with valid JSON: {"action":"BUY","reason":"..."} or SELL or CLOSE or HOLD."""
+ENTRY RULES — LONG (BUY): ALL must be true:
+- RSI < 40
+- Price ABOVE EMA20
+- Funding rate <= 0.01%
+- ATR > 24h average ATR (avoid flat/range markets)
+
+ENTRY RULES — SHORT (SELL): ALL must be true:
+- RSI > 60
+- Price BELOW EMA20
+- Funding rate >= -0.01%
+- ATR > 24h average ATR
+
+CLOSE RULES:
+- NEVER use CLOSE if open position profit is below +2%. Let SL/TP handle it.
+- Only CLOSE if profit >= +2% AND clear reversal signal.
+
+GENERAL:
+- If conditions are not ALL met, respond HOLD and wait. Do not force trades.
+- It is OK to HOLD many cycles if no clean setup exists.
+- Keep reason under 50 words.
+- Respond ONLY with valid JSON: {"action":"BUY","reason":"..."} or SELL or CLOSE or HOLD."""
 
         current_market = (
             f"BTC: ${market.get('price'):,.2f} | RSI: {market.get('rsi')} | MACD: {market.get('macd')}\n"
             f"EMA20: ${market.get('ema20'):,.2f} | EMA200: ${market.get('ema200'):,.2f}\n"
             f"BB: [{market.get('bb_lower'):,.2f} - {market.get('bb_upper'):,.2f}]\n"
             f"Pivot: {market.get('pivot')} | R1: {market.get('r1')} | S1: {market.get('s1')}\n"
-            f"ATR: {market.get('atr')} | {market.get('order_book')}\n"
+            f"ATR: {market.get('atr')} (24h avg: {market.get('atr_24h_avg')}) | {market.get('order_book')}\n"
             f"Forecast: {market.get('forecast')}\n"
             f"{oi_funding} | Fear&Greed: {fear_greed}\n"
             f"Whale: {whale}\n"
@@ -632,8 +698,8 @@ RULES:
 
 # ─── MAIN LOOP ───────────────────────────────────────────────────────────────
 def main():
-    global last_daily_report
-    log("AI Trading Bot avviato! [v4 — tick size fix]")
+    global last_daily_report, position_open_time
+    log("AI Trading Bot avviato! [v5 — filtri rafforzati, SL/TP 1.2/4%, tracking durata]")
     log(f"API address:  {account.address}")
     log(f"Main address: {HYPERLIQUID_ADDR}")
     log(f"Analisi ogni {INTERVAL//60} min | Monitoraggio ogni {MONITOR//60} min")
@@ -725,7 +791,9 @@ def main():
                         pos     = positions[0]
                         success = close_position(pos)
                         if success:
-                            record_trade(pos["side"], pos["entry"], market["price"], pos["pnl"], "AI CLOSE")
+                            dur = round((time.time() - position_open_time) / 60) if position_open_time else None
+                            record_trade(pos["side"], pos["entry"], market["price"], pos["pnl"], "AI CLOSE", dur)
+                            position_open_time = None
                             decision_history[-1]["outcome"] = f"CLOSED @ ${market['price']:,.2f} PnL=${pos['pnl']:.4f}"
                             save_history()
                             notify("🔒 *Posizione chiusa da AI*\n" + reason, important=True)
