@@ -83,6 +83,31 @@ def load_history():
     except Exception as e:
         log(f"[ERRORE] Load history: {e}")
 
+# ─── PNL REALE DA HYPERLIQUID ─────────────────────────────────────────────────
+def get_real_closed_pnl():
+    """
+    Legge il PnL reale dell'ultima chiusura da Hyperliquid (userFills).
+    Restituisce (pnl, exit_price) oppure (None, None) se non disponibile.
+    Cerca l'ultimo fill di tipo 'Close' per SYMBOL.
+    """
+    try:
+        r = requests.post(f"{HL_URL}/info",
+                          json={"type": "userFills", "user": HYPERLIQUID_ADDR},
+                          timeout=15)
+        fills = r.json()
+        if not isinstance(fills, list):
+            return None, None
+        # I fills sono ordinati dal più recente; cerca il primo 'Close' di BTC
+        for fill in fills:
+            if fill.get("coin") == SYMBOL and "Close" in fill.get("dir", ""):
+                pnl   = float(fill.get("closedPnl", 0))
+                price = float(fill.get("px", 0))
+                return pnl, price
+        return None, None
+    except Exception as e:
+        log(f"[ERRORE] userFills: {e}")
+        return None, None
+
 # ─── STATS ───────────────────────────────────────────────────────────────────
 def record_trade(side, entry, exit_price, pnl, reason="", duration_min=None):
     global trade_history
@@ -445,20 +470,28 @@ def monitor_positions():
 
     if not positions:
         if last_known_position is not None:
-            prev  = last_known_position
+            prev = last_known_position
+            # FIX: leggi il PnL REALE da Hyperliquid invece di stimarlo
+            real_pnl, real_exit = get_real_closed_pnl()
             price = get_price()
-            if prev["side"] == "LONG":
-                est_pnl = (price - prev["entry"]) * abs(prev["size"])
+            if real_pnl is not None:
+                pnl       = real_pnl
+                exit_px   = real_exit if real_exit else price
             else:
-                est_pnl = (prev["entry"] - price) * abs(prev["size"])
-            reason = "TP HIT" if est_pnl >= 0 else "SL HIT"
+                # Fallback: stima corretta (differenza prezzo × size, NON nozionale)
+                if prev["side"] == "LONG":
+                    pnl = (price - prev["entry"]) * abs(prev["size"])
+                else:
+                    pnl = (prev["entry"] - price) * abs(prev["size"])
+                exit_px = price
+            reason = "TP HIT" if pnl >= 0 else "SL HIT"
             dur    = round((time.time() - position_open_time) / 60) if position_open_time else None
-            record_trade(prev["side"], prev["entry"], price, est_pnl, reason, dur)
+            record_trade(prev["side"], prev["entry"], exit_px, pnl, reason, dur)
             notify(
-                f"{'✅' if est_pnl >= 0 else '🔴'} *{reason}*\n"
+                f"{'✅' if pnl >= 0 else '🔴'} *{reason}*\n"
                 f"{prev['side']} BTC\n"
-                f"Entry: ${prev['entry']:,.1f} → ${price:,.1f}\n"
-                f"PnL: ${est_pnl:.4f} USDC"
+                f"Entry: ${prev['entry']:,.1f} → ${exit_px:,.1f}\n"
+                f"PnL: ${pnl:.4f} USDC"
                 + (f"\nDurata: {dur} min" if dur is not None else ""),
                 important=True
             )
@@ -712,10 +745,7 @@ GENERAL:
         json_match = re.search(r'```json\s*(\{.*?\})\s*```', text, re.DOTALL)
         if not json_match:
             json_match = re.search(r'(\{.*?\})', text, re.DOTALL)
-        if json_match:
-            json_str = json_match.group(1)
-        else:
-            json_str = text
+        json_str = json_match.group(1) if json_match else text
 
         try:
             decision = json.loads(json_str)
@@ -735,7 +765,7 @@ GENERAL:
 # ─── MAIN LOOP ───────────────────────────────────────────────────────────────
 def main():
     global last_daily_report, position_open_time
-    log("AI Trading Bot avviato! [v5 — filtri rafforzati, SL/TP 1.2/4%, tracking durata]")
+    log("AI Trading Bot avviato! [v6 — PnL reale da Hyperliquid]")
     log(f"API address:  {account.address}")
     log(f"Main address: {HYPERLIQUID_ADDR}")
     log(f"Analisi ogni {INTERVAL//60} min | Monitoraggio ogni {MONITOR//60} min")
@@ -827,10 +857,14 @@ def main():
                         pos     = positions[0]
                         success = close_position(pos)
                         if success:
+                            time.sleep(2)
+                            real_pnl, real_exit = get_real_closed_pnl()
+                            pnl     = real_pnl if real_pnl is not None else pos["pnl"]
+                            exit_px = real_exit if real_exit else market["price"]
                             dur = round((time.time() - position_open_time) / 60) if position_open_time else None
-                            record_trade(pos["side"], pos["entry"], market["price"], pos["pnl"], "AI CLOSE", dur)
+                            record_trade(pos["side"], pos["entry"], exit_px, pnl, "AI CLOSE", dur)
                             position_open_time = None
-                            decision_history[-1]["outcome"] = f"CLOSED @ ${market['price']:,.2f} PnL=${pos['pnl']:.4f}"
+                            decision_history[-1]["outcome"] = f"CLOSED @ ${exit_px:,.2f} PnL=${pnl:.4f}"
                             save_history()
                             notify("🔒 *Posizione chiusa da AI*\n" + reason, important=True)
                             last_analysis = 0
